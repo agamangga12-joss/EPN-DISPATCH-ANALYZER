@@ -22,6 +22,7 @@ import {
 export type AppPage =
   | "dashboard"
   | "master-data"
+  | "restricted-roads"
   | "tag-consistency"
   | "departure-intelligence"
   | "pairing-intelligence"
@@ -56,6 +57,7 @@ const navGroups: NavGroup[] = [
     label: "Data Foundation",
     items: [
       { page: "master-data", label: "Master Data", icon: Database },
+      { page: "restricted-roads", label: "Restricted Roads", icon: MapPinned },
       { page: "tag-consistency", label: "Tag Consistency", icon: ShieldCheck },
     ],
   },

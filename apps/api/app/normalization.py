@@ -94,9 +94,12 @@ def source_time(value: Any, default: time | None = None) -> time | None:
 def mt_capacity_kl(capacity_label: Any, vehicle_type_tag: Any) -> float | None:
     """Resolve an MT capacity in KL from canonical master fields.
 
-    The explicit capacity label is preferred; the numeric vehicle class remains
-    a compatibility fallback for older imported MT rows.
+    The numeric vehicle class is authoritative. The old label is accepted only
+    as a fallback for records imported before the consolidated master format.
     """
+    capacity = source_number(vehicle_type_tag)
+    if capacity is not None and math.isfinite(capacity) and capacity > 0:
+        return capacity
     label = clean_str(capacity_label)
     if label:
         match = re.search(r"([0-9]+(?:[\.,][0-9]+)?)", label)

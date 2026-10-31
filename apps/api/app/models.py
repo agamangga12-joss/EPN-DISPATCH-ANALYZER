@@ -10,11 +10,33 @@ class Base(DeclarativeBase):
     pass
 
 
+class MasterRestrictedRoad(Base):
+    __tablename__ = "master_restricted_road"
+
+    restricted_road_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    reason: Mapped[str] = mapped_column(Text)
+    # Confirmed GeoJSON LineString coordinates, in longitude/latitude order.
+    geometry: Mapped[list] = mapped_column(JSON)
+    direction: Mapped[str] = mapped_column(String(16), default="BOTH")
+    forward_waypoints: Mapped[list] = mapped_column(JSON, default=list)
+    reverse_waypoints: Mapped[list] = mapped_column(JSON, default=list)
+    buffer_meters: Mapped[float] = mapped_column(Float, default=12)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    valid_from = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_until = mapped_column(DateTime(timezone=True), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ImportAudit(Base):
     __tablename__ = "import_audit"
 
     import_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     domain: Mapped[str] = mapped_column(String(40), index=True)
+    depot_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
     filename: Mapped[str] = mapped_column(String(255))
     file_checksum: Mapped[str | None] = mapped_column(String(128))
     sheet_name: Mapped[str | None] = mapped_column(String(255))
@@ -178,6 +200,8 @@ class MasterSPBU(Base):
     source_coordinate: Mapped[str | None] = mapped_column(String(255))
     master_distance_km: Mapped[float | None] = mapped_column(Float)
     master_travel_time_min: Mapped[float | None] = mapped_column(Float)
+    master_rth_min: Mapped[float | None] = mapped_column(Float)
+    master_travel_time_sample_count: Mapped[int] = mapped_column(Integer, default=0)
     vehicle_type_tag: Mapped[int | None] = mapped_column(Integer)
     project_tag_raw: Mapped[str | None] = mapped_column(Text)
     primary_depot_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_depot.depot_id"))
@@ -1391,6 +1415,7 @@ class VehicleOperationalState(Base):
     registration_snapshot: Mapped[str | None] = mapped_column(String(80))
     vehicle_class: Mapped[int | None] = mapped_column(Integer)
     tag_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    disabled_tag_ids: Mapped[list] = mapped_column(JSON, default=list)
     capacity_kl: Mapped[float] = mapped_column(Float, default=0)
     number_of_compartments: Mapped[int] = mapped_column(Integer, default=0)
     compartment_configuration: Mapped[list] = mapped_column(JSON, default=list)

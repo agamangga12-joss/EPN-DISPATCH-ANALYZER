@@ -4,6 +4,7 @@ import hashlib
 from collections import Counter, defaultdict
 from datetime import date, datetime, timezone
 from math import floor
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import desc, func, select
@@ -455,8 +456,13 @@ def build_observations(rows: list, gps_lookup: dict[str, datetime], quantity_loo
         if key in seen:
             continue
         seen.add(key)
-        gps_dt = gps_lookup.get(shipment.shipment_id)
-        lo_dt = shipment.gate_out_datetime
+        zone = ZoneInfo(depot.timezone or "Asia/Jakarta")
+        def local_time(value):
+            if value is None:
+                return None
+            return value.replace(tzinfo=zone) if value.tzinfo is None else value.astimezone(zone)
+        gps_dt = local_time(gps_lookup.get(shipment.shipment_id))
+        lo_dt = local_time(shipment.gate_out_datetime)
         used_dt = gps_dt or lo_dt
         source = "GPS" if gps_dt else "LO_GATE_OUT" if lo_dt else None
         quantity = quantity_lookup.get(key, {"quantity": 0.0, "products": set()})

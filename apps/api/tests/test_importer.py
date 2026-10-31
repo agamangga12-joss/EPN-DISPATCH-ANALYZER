@@ -79,7 +79,7 @@ def test_spbu_import_preserves_decimal_comma_coordinate(db_session, tmp_path) ->
 
     spbu = db_session.scalar(select(MasterSPBU).where(MasterSPBU.spbu_code == "11201199"))
     assert spbu is not None
-    assert spbu.source_coordinate == "5,19182389869645 96,4368560343681"
+    assert spbu.source_coordinate == "5.19182389869645 96.4368560343681"
     assert spbu.latitude == 5.19182389869645
     assert spbu.longitude == 96.4368560343681
 

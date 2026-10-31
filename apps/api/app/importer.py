@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, time
+from zoneinfo import ZoneInfo
+
+import pandas as pd
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +36,7 @@ from .models import (
     StgSPBU,
     TagAlias,
 )
+from .master_data import consolidate_master, refresh_historical_travel_times, rebuild_shipment_membership
 from .normalization import (
     clean_str,
     combine_datetime,
@@ -73,17 +77,43 @@ def row_value(row: dict[str, Any], *keys: str) -> Any:
 
 
 class ImportProcessor:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, depot_id: str | None = None):
         self.db = db
+        self.depot_id = depot_id
+
+    def scope_rows(self, rows: list[dict]) -> list[dict]:
+        if not self.depot_id:
+            return rows
+        depot = self.db.get(MasterDepot, self.depot_id)
+        if not depot or depot.active_status != "ACTIVE":
+            raise ValueError("Pilih depot aktif yang valid sebelum upload.")
+        # Capture the upload context; source files cannot override this depot.
+        return [{**row, "depot_id": depot.depot_id, "source_depot_name": depot.depot_name} for row in rows]
+
+    @staticmethod
+    def shipment_datetime(row: dict, field: str, date_keys: tuple, time_keys: tuple, depot: MasterDepot):
+        value = row_value(row, field)
+        if value is not None:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                raise ValueError(f"{field} harus berformat YYYY-MM-DD HH:MM:SS")
+            result = parsed.to_pydatetime()
+        else:
+            result = combine_datetime(row_value(row, *date_keys), row_value(row, *time_keys))
+        if result is not None and result.tzinfo is None:
+            result = result.replace(tzinfo=ZoneInfo(depot.timezone or "Asia/Jakarta"))
+        return result
 
     def upsert_active(self, model, primary_key: str, values: dict):
         record = self.db.get(model, primary_key)
         if record is None:
             record = model(**values)
+            consolidate_master(record)
             self.db.add(record)
             return record
         for field, value in values.items():
             setattr(record, field, value)
+        consolidate_master(record)
         return record
 
     def validate_required_columns(self, rows: list[dict[str, Any]], domain: str, required_columns: tuple[str, ...]) -> None:
@@ -162,7 +192,7 @@ class ImportProcessor:
             if not audit:
                 raise ValueError("Queued import audit was not found.")
             audit.status = "PROCESSING"
-            audit.mapping_version = "phase0.v2"
+            audit.mapping_version = "phase0.v3"
             audit.started_at = audit.started_at or datetime.now(UTC)
             audit.error_message = None
             self.db.flush()
@@ -176,7 +206,8 @@ class ImportProcessor:
             sheet_name=sheet_name,
             uploaded_by=uploaded_by,
             status="STAGED",
-            mapping_version="phase0.v2",
+            mapping_version="phase0.v3",
+            depot_id=self.depot_id,
         )
         self.db.add(audit)
         self.db.flush()
@@ -291,7 +322,7 @@ class ImportProcessor:
     ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("Mobil Tangki", "MOBIL_TANGKI"))
         audit = self.create_import("MOBIL_TANGKI", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
-        rows = dataframe_records(path, actual_sheet_name)
+        rows = self.scope_rows(dataframe_records(path, actual_sheet_name))
         required_groups = (("depot_id",), ("vehicle_registration", "name", "vehicle_name_raw")) if require_depot_id else (("vehicle_registration", "name", "vehicle_name_raw"),)
         self.validate_required_column_groups(rows, "MOBIL_TANGKI", required_groups)
         if require_depot_id:
@@ -377,6 +408,8 @@ class ImportProcessor:
         audit.warning_rows = warnings
         audit.rejected_rows = rejected
         audit.processed_rows = len(rows)
+        if audit.domain in {"SPBU", "LOADING_ORDER"}:
+            refresh_historical_travel_times(self.db, self.depot_id)
         audit.status = "PUBLISHED"
         audit.published_at = datetime.now(UTC)
         audit.completed_at = audit.published_at
@@ -393,7 +426,7 @@ class ImportProcessor:
     ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("SPBU", "Lembaga Penyalur"))
         audit = self.create_import("SPBU", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
-        rows = dataframe_records(path, actual_sheet_name)
+        rows = self.scope_rows(dataframe_records(path, actual_sheet_name))
         required_groups = (("depot_id",), ("spbu_code", "Nama SPBU")) if require_depot_id else (("spbu_code", "Nama SPBU"),)
         self.validate_required_column_groups(rows, "SPBU", required_groups)
         if require_depot_id:
@@ -457,7 +490,7 @@ class ImportProcessor:
                     "longitude": lon,
                     "source_coordinate": source_coordinate,
                     "master_distance_km": source_number(row_value(row, "master_distance_km", "jarak_km")),
-                    "master_travel_time_min": source_number(row_value(row, "master_travel_time_min", "waktu_menit")),
+                    "master_travel_time_min": None,
                     "vehicle_type_tag": source_int(row_value(row, "vehicle_type_tag", "Vehicle Type tag")),
                     "project_tag_raw": clean_str(row_value(row, "project_tag", "project_tag_raw", "Project tag")),
                     "primary_depot_id": depot.depot_id if depot else None,
@@ -484,6 +517,8 @@ class ImportProcessor:
         audit.warning_rows = warnings
         audit.rejected_rows = rejected
         audit.processed_rows = len(rows)
+        if audit.domain in {"SPBU", "LOADING_ORDER"}:
+            refresh_historical_travel_times(self.db, self.depot_id)
         audit.status = "PUBLISHED"
         audit.published_at = datetime.now(UTC)
         audit.completed_at = audit.published_at
@@ -509,11 +544,11 @@ class ImportProcessor:
         existing_import_id: str | None = None,
         require_depot_id: bool = False,
     ) -> str:
-        actual_sheet_name = resolve_sheet_name(path, sheet_name, ("Data Medan Mei", "Loading Orders", "LOADING_ORDER"))
+        actual_sheet_name = resolve_sheet_name(path, sheet_name, ("Historikal Shipment", "Data Medan Mei", "Loading Orders", "LOADING_ORDER"))
         audit = self.create_import("LOADING_ORDER", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
-        rows = dataframe_records(path, actual_sheet_name)
+        rows = self.scope_rows(dataframe_records(path, actual_sheet_name))
         required_groups = (
-            (("depot_id",), ("shipment_id",), ("loading_order_number",), ("source_depot_name", "tbbm"))
+            (("depot_id",), ("shipment_id",), ("loading_order_number",))
             if require_depot_id
             else (("shipment_id",), ("loading_order_number",), ("source_depot_name", "tbbm"))
         )
@@ -595,9 +630,9 @@ class ImportProcessor:
                     )
                     rejected += 1
                 continue
-            validation_dt = combine_datetime(row_value(first, "validation_date", "date_validasi"), row_value(first, "validation_time", "Jam Validasi"))
-            gate_out_dt = combine_datetime(row_value(first, "gate_out_date", "date_gate_out"), row_value(first, "gate_out_time", "Jam_gateout"))
-            end_dt = combine_datetime(row_value(first, "shipment_end_date", "date_end_shipment"), row_value(first, "shipment_end_time", "jam_end_shipment"))
+            validation_dt = self.shipment_datetime(first, "validation_datetime", ("validation_date", "date_validasi", "operating_date", "date"), ("validation_time", "Jam Validasi"), depot)
+            gate_out_dt = self.shipment_datetime(first, "gate_out_datetime", ("gate_out_date", "date_gate_out"), ("gate_out_time", "Jam_gateout"), depot)
+            end_dt = self.shipment_datetime(first, "shipment_end_datetime", ("shipment_end_date", "date_end_shipment"), ("shipment_end_time", "jam_end_shipment"), depot)
             driver_name = clean_str(row_value(first, "driver_name", "supir"))
             driver_nip = clean_str(row_value(first, "driver_nip", "nip_supir"))
             assistant_name = clean_str(row_value(first, "assistant_name", "kernet"))
@@ -618,10 +653,7 @@ class ImportProcessor:
             end_values = {
                 value
                 for value in (
-                    combine_datetime(
-                        row_value(item["row"], "shipment_end_date", "date_end_shipment"),
-                        row_value(item["row"], "shipment_end_time", "jam_end_shipment"),
-                    )
+                    self.shipment_datetime(item["row"], "shipment_end_datetime", ("shipment_end_date", "date_end_shipment"), ("shipment_end_time", "jam_end_shipment"), depot)
                     for item in grouped
                 )
                 if value
@@ -629,11 +661,14 @@ class ImportProcessor:
             if len(end_values) > 1:
                 messages.append("shipment contains multiple endshipment values")
             shipment_pk = source_shipment_id
+            existing = self.db.get(FactShipment, shipment_pk)
+            if existing and existing.depot_id != depot.depot_id:
+                raise ValueError(f"Shipment ID {source_shipment_id} sudah digunakan depot lain; gunakan ID shipment yang unik.")
             self.db.merge(
                 FactShipment(
                     shipment_id=shipment_pk,
                     source_shipment_id=source_shipment_id,
-                    operating_date=combine_datetime(row_value(first, "operating_date", "date"), None).date() if combine_datetime(row_value(first, "operating_date", "date"), None) else None,
+                    operating_date=validation_dt.astimezone(ZoneInfo(depot.timezone or "Asia/Jakarta")).date() if validation_dt else None,
                     area_id=clean_str(first.get("area_id")),
                     area=clean_str(first.get("area")),
                     depot_id=depot.depot_id if depot else None,
@@ -660,7 +695,7 @@ class ImportProcessor:
                 row = item["row"]
                 row_number = item["row_number"]
                 lo_number = clean_str(row.get("loading_order_number"))
-                source_depot_name = clean_str(row_value(row, "source_depot_name", "tbbm"))
+                source_depot_name = depot.depot_name
                 spbu_code = clean_str(row_value(row, "source_spbu_code", "spbu_code", "nama_spbu"))
                 spbu = spbu_by_code.get((depot.depot_id, spbu_code)) if depot and spbu_code else None
                 source_product_name = row_value(row, "source_product_name", "product_name", "produk")
@@ -718,8 +753,8 @@ class ImportProcessor:
                         source_product_name=clean_str(source_product_name),
                         quantity=source_number(row.get("quantity")),
                         status=clean_str(row.get("status")),
-                        source_distance_km=source_number(row_value(row, "source_distance_km", "jarak_spbu")),
-                        actual_km=source_number(row_value(row, "actual_km", "km_aktual")),
+                        source_distance_km=source_number(row_value(row, "actual_km", "km_aktual", "source_distance_km", "jarak_spbu")),
+                        actual_km=source_number(row_value(row, "actual_km", "km_aktual", "source_distance_km", "jarak_spbu")),
                         source_import_id=audit.import_id,
                     )
                 )
@@ -728,11 +763,14 @@ class ImportProcessor:
                     shipto = clean_str(row.get("shipto"))
                     if shipto:
                         self.db.merge(SpbuIdentifierAlias(spbu_identifier_alias_id=make_id("spbualias", spbu.spbu_id, "SHIPTO", shipto), spbu_id=spbu.spbu_id, identifier_type="SHIPTO", identifier_value=shipto, normalized_identifier=normalize_key(shipto) or shipto, source_system="LO"))
+        rebuild_shipment_membership(self.db, by_shipment.keys())
         audit.total_rows = len(rows)
         audit.valid_rows = valid
         audit.warning_rows = warnings
         audit.rejected_rows = rejected
         audit.processed_rows = len(rows)
+        if audit.domain in {"SPBU", "LOADING_ORDER"}:
+            refresh_historical_travel_times(self.db, self.depot_id)
         audit.status = "PUBLISHED"
         audit.published_at = datetime.now(UTC)
         audit.completed_at = audit.published_at
@@ -748,7 +786,7 @@ class ImportProcessor:
     ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("GPS", "GPS Data"))
         audit = self.create_import("GPS", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
-        rows = dataframe_records(path, actual_sheet_name)
+        rows = self.scope_rows(dataframe_records(path, actual_sheet_name))
         self.validate_required_columns(rows, "GPS", ("vehicle_registration", "event_datetime"))
         for row_number, row in enumerate(rows, start=2):
             self.db.add(StgGPSData(staging_id=make_id("stggps", audit.import_id, row_number), import_id=audit.import_id, source_row_number=row_number, raw_payload=row, normalized_payload={}, validation_status="PENDING_MAPPING", validation_messages=["GPS physical schema requires source mapping review"]))

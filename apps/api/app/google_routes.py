@@ -288,6 +288,8 @@ class GoogleRoutesClient:
         routing_mode: str,
         routing_preference: str,
         intermediates: list[tuple[float, float]] | None = None,
+        via_intermediates: bool = False,
+        high_quality: bool = False,
     ) -> dict:
         if routing_mode not in SUPPORTED_ROUTING_MODES:
             raise GoogleRoutesError(
@@ -300,11 +302,16 @@ class GoogleRoutesClient:
             "destination": self._waypoint(*destination),
             "travelMode": "DRIVE",
             "routingPreference": routing_preference,
-            "polylineQuality": "OVERVIEW",
+            "polylineQuality": "HIGH_QUALITY" if high_quality else "OVERVIEW",
             "polylineEncoding": "GEO_JSON_LINESTRING",
         }
         if intermediates:
+            if len(intermediates) > 25:
+                raise GoogleRoutesError("GOOGLE_WAYPOINT_LIMIT", "At most 25 intermediate waypoints are supported.", status_code=422)
             payload["intermediates"] = [self._waypoint(latitude, longitude) for latitude, longitude in intermediates]
+            if via_intermediates:
+                for waypoint in payload["intermediates"]:
+                    waypoint["via"] = True
         departure = self._future_departure(departure_datetime)
         if departure:
             payload["departureTime"] = departure
@@ -325,6 +332,8 @@ class GoogleRoutesClient:
             "route_geometry_source": "GOOGLE_ROUTES_GEOJSON",
             "restrictions_partially_ignored": bool((route.get("travelAdvisory") or {}).get("routeRestrictionsPartiallyIgnored")),
             "warnings": route.get("warnings") or [],
+            "departure_time_sent": departure,
+            "routing_preference": routing_preference,
         }
 
     def compute_route_matrix(

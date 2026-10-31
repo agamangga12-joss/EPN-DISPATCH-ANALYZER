@@ -6,6 +6,8 @@ import math
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from threading import Event
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
 
@@ -27,6 +29,7 @@ from .models import (
     RouteVersionTrip,
 )
 from .road_geometry import OSRMRoadGeometryClient, RoadGeometryError
+from .restricted_roads import RestrictedRoadRouter, RestrictedRoutingError, GoogleRequestBudget, UNREACHABLE
 
 
 def _utc(value: datetime) -> datetime:
@@ -71,6 +74,7 @@ class RouteMatrixService:
                 self.client = None
         self.road_geometry_client = OSRMRoadGeometryClient()
         self.google_geometry_blocked = False
+        self._restricted_estimates: dict[tuple[str, str], dict] = {}
         self._route_history_by_sequence: dict[tuple[str, tuple[str, ...]], tuple[str, str]] | None = None
         self._prediction_history_by_sequence: dict[tuple[str, tuple[str, ...]], str] | None = None
 
@@ -87,7 +91,131 @@ class RouteMatrixService:
             "vehicle_mode": parameters.get("route_vehicle_mode", "GENERAL_VEHICLE"),
             "traffic_aware": bool(parameters.get("traffic_aware", True)),
         }
+        if parameters.get("restricted_roads", {}).get("roads"):
+            payload.update({"restricted_roads": parameters["restricted_roads"]["checksum"],
+                            "provider": "GOOGLE_RESTRICTED_WAYPOINTS",
+                            "google_configuration_version": self.configuration.configuration_version if self.configuration else None,
+                            "coordinates": [_coordinates(origin), _coordinates(destination)],
+                            "restricted_routing_contract": 2})
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _build_restricted(self, *, depot, loading_orders, spbus, departure, parameters, progress_callback=None):
+        started = perf_counter()
+        snapshot = parameters["restricted_roads"]
+        router = RestrictedRoadRouter(self.db, client=self.client)
+        entities = [depot, *[spbus[row["spbu_id"]] for row in loading_orders]]
+        unique = {_location_id(entity): entity for entity in entities}
+        pairs = [(a, b) for a in unique.values() for b in unique.values() if _location_id(a) != _location_id(b)]
+        time_limit = int(parameters.get("restricted_matrix_time_limit_seconds", 900))
+        worker_count = int(parameters.get("restricted_matrix_workers", 4))
+        deadline = started + time_limit
+        budget = GoogleRequestBudget(parameters.get("route_matrix_google_element_budget", 2500))
+        cancel_event = Event()
+        keys = [self._key(a, b, departure, parameters) for a, b in pairs]
+        cache_rows, hits = {}, 0
+        use_cache = bool(parameters.get("route_matrix_cache_enabled", True))
+        if use_cache:
+            for offset in range(0, len(keys), 500):
+                for row in self.db.scalars(select(RouteMatrixCache).where(RouteMatrixCache.cache_key.in_(keys[offset:offset + 500]))):
+                    cache_rows[row.cache_key] = row
+        missing = []
+        for (origin, destination), key in zip(pairs, keys):
+            cached = cache_rows.get(key)
+            if (cached and cached.expires_at and _utc(cached.expires_at) > datetime.now(timezone.utc)
+                    and cached.provider in {"GOOGLE_RESTRICTED_WAYPOINTS", "GOOGLE_RESTRICTED_UNRESOLVED"}
+                    and (cached.response_metadata or {}).get("restriction_checksum") == snapshot["checksum"]):
+                self._restricted_estimates[_location_id(origin), _location_id(destination)] = self._cached_estimate(cached)
+                hits += 1
+            else:
+                first, second = _coordinates(origin), _coordinates(destination)
+                if first is None or second is None:
+                    raise RestrictedRoutingError("RESTRICTED_ROUTING_COORDINATES_REQUIRED", "All depot/SPBU coordinates are required when restricted roads apply.")
+                # Resolve ORM values on the coordinator thread. Workers receive
+                # primitives only and never read/write the SQLAlchemy session.
+                missing.append((origin, destination, key, [[first[1], first[0]], [second[1], second[0]]]))
+        completed, active, geometry_seconds = hits, 0, 0.0
+        last_progress = 0.0
+        def progress(force=False):
+            nonlocal last_progress
+            if progress_callback and (force or perf_counter() - last_progress >= 5):
+                last_progress = perf_counter()
+                progress_callback({"total_unique_pairs": len(pairs), "completed_unique_pairs": completed,
+                    "restricted_request_count": budget.used, "cache_hit_count": hits,
+                    "active_pair_count": active, "workers": worker_count, "time_limit_seconds": time_limit,
+                    "elapsed_seconds": round(perf_counter() - started, 2),
+                    "geometry_check_seconds": round(geometry_seconds, 3)})
+        progress(True)
+        if len(missing) > budget.limit:
+            raise RestrictedRoutingError("RESTRICTED_GOOGLE_REQUEST_BUDGET", f"At least {len(missing)} Google requests are needed for uncached pairs, but the budget is {budget.limit}. Increase the matrix request budget.")
+        first_error = None
+        remaining = iter(missing)
+        def submit_next(pool, pending):
+            nonlocal active
+            item = next(remaining, None)
+            if item is not None:
+                future = pool.submit(router.route, item[3], snapshot["roads"], departure=departure,
+                    traffic_aware=bool(parameters.get("traffic_aware", True)), request_budget=budget,
+                    deadline=deadline, cancel_event=cancel_event)
+                pending[future] = item
+                active = len(pending)
+        if missing:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="restricted-matrix") as pool:
+                pending = {}
+                for _ in range(worker_count):
+                    submit_next(pool, pending)
+                while pending:
+                    if first_error is None and perf_counter() >= deadline:
+                        first_error = RestrictedRoutingError("RESTRICTED_MATRIX_TIME_LIMIT", f"Restricted matrix reached its {time_limit}-second limit after {completed}/{len(pairs)} pairs. Increase Restricted Matrix Time Limit in the parameter profile.")
+                        cancel_event.set()
+                    done, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        origin, destination, key, _ = pending.pop(future)
+                        active = len(pending)
+                        try:
+                            estimate = future.result()
+                            estimate["metadata"]["restriction_checksum"] = snapshot["checksum"]
+                            geometry_seconds += float(estimate["metadata"].get("geometry_check_seconds") or 0)
+                            self._restricted_estimates[_location_id(origin), _location_id(destination)] = estimate
+                            if use_cache:
+                                self._store_cache_estimate(cache_rows=cache_rows, key=key, origin=origin, destination=destination,
+                                    departure=departure, parameters=parameters, estimate=estimate)
+                            completed += 1
+                            # Persist successful work even when a different pair
+                            # failed; retries should reuse verified cached paths.
+                            progress(True)
+                        except Exception as exc:
+                            if first_error is None:
+                                first_error = exc
+                                cancel_event.set()
+                        if first_error is None and perf_counter() < deadline:
+                            submit_next(pool, pending)
+                    progress()
+            if first_error is not None:
+                raise first_error
+            if completed != len(pairs):
+                raise RestrictedRoutingError("RESTRICTED_MATRIX_TIME_LIMIT", f"Restricted matrix time limit reached after {completed}/{len(pairs)} pairs. Increase Restricted Matrix Time Limit in the parameter profile.")
+        calls = budget.used
+        size = len(entities)
+        distances, times, geometry = [[0] * size for _ in entities], [[0] * size for _ in entities], {}
+        for i, a in enumerate(entities):
+            for j, b in enumerate(entities):
+                if _location_id(a) == _location_id(b):
+                    continue
+                estimate = self._restricted_estimates[_location_id(a), _location_id(b)]
+                distances[i][j], times[i][j] = estimate["distance_meters"], estimate["duration_seconds"]
+                geometry[f"{i}:{j}"] = {"geometry": estimate["route_geometry"], "provider": estimate["provider"]}
+        self.db.add(RouteAPIRequestLog(request_log_id=uuid.uuid4().hex, job_id=self.job_id,
+            request_type="PHASE7_MATRIX_BUILD", provider="GOOGLE_RESTRICTED_WAYPOINTS", request_fingerprint=snapshot["checksum"],
+            requested_pair_count=len(pairs), cache_hit_count=hits, duration_ms=round((perf_counter() - started) * 1000), success=True))
+        return {"distance_matrix": distances, "time_matrix": times, "geometry": geometry,
+                "metadata": {"location_count": size, "pair_count": size * (size - 1), "unique_pair_count": len(pairs),
+                    "cache_hit_count": hits, "google_request_count": calls, "restricted_request_count": calls,
+                    "fallback_pair_count": 0, "provider": "GOOGLE_RESTRICTED_WAYPOINTS",
+                    "review_required_pair_count": sum(e["duration_seconds"] >= UNREACHABLE for e in self._restricted_estimates.values()),
+                    "restriction_checksum": snapshot["checksum"], "restriction_count": len(snapshot["roads"]),
+                    "traffic_aware": bool(parameters.get("traffic_aware", True)), "matrix_duration_ms": round((perf_counter() - started) * 1000),
+                    "workers": worker_count, "time_limit_seconds": time_limit,
+                    "geometry_check_seconds": round(geometry_seconds, 3)}}
 
     def _fallback(self, origin: MasterDepot | MasterSPBU, destination: MasterDepot | MasterSPBU) -> dict:
         first, second = _coordinates(origin), _coordinates(destination)
@@ -226,6 +354,9 @@ class RouteMatrixService:
         progress_callback: Callable[[dict], None] | None = None,
     ) -> dict:
         started = perf_counter()
+        if parameters.get("restricted_roads", {}).get("roads"):
+            return self._build_restricted(depot=depot, loading_orders=loading_orders, spbus=spbus,
+                departure=departure, parameters=parameters, progress_callback=progress_callback)
         # The solver retains one node per LO, but road estimates are materialized
         # once per unique physical location and expanded back to LO-node indexes.
         # This prevents duplicate LOs for one SPBU from multiplying SQL and HTTP
@@ -719,6 +850,22 @@ class RouteMatrixService:
         parameters: dict,
     ) -> dict:
         """Fetch geometry only for final solver-selected legs, never callbacks."""
+        if parameters.get("restricted_roads", {}).get("roads"):
+            entities = [depot, *ordered_spbus, depot]
+            points = []
+            evidence = []
+            for origin, destination in zip(entities, entities[1:]):
+                if _location_id(origin) == _location_id(destination):
+                    continue
+                estimate = self._restricted_estimates.get((_location_id(origin), _location_id(destination)))
+                if not estimate or estimate["duration_seconds"] >= UNREACHABLE or not estimate["route_geometry"]:
+                    raise RestrictedRoutingError("RESTRICTED_SELECTED_LEG_INVALID", "Selected trip has no verified restricted-road matrix geometry.")
+                evidence.append({"origin": _location_id(origin), "destination": _location_id(destination), "metadata": estimate.get("metadata", {})})
+                leg = estimate["route_geometry"]
+                points.extend(leg[1:] if points and points[-1] == leg[0] else leg)
+            return {"route_geometry": points, "route_geometry_source": "GOOGLE_RESTRICTED_WAYPOINTS",
+                    "google_request_count": 0, "cache_hit_count": 0,
+                    "restriction_checksum": parameters["restricted_roads"]["checksum"], "restricted_legs": evidence}
         started = perf_counter()
         google_request_budget = max(0, int(parameters.get("route_geometry_google_request_budget", 500)))
         geometry_time_limit = max(0, int(parameters.get("route_geometry_time_limit_seconds", 120)))

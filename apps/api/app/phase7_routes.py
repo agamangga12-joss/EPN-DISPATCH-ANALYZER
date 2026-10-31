@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, UploadFile, status
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .database import get_db
 from .phase7_constants import constraint_catalog
+from .phase7_readiness import import_readiness, readiness_template
 from .phase7_service import (
     create_job,
+    add_job_lo,
+    cancel_job_los,
+    job_lo_options,
     delete_bay_configuration,
     delete_job,
     enqueue_optimization,
@@ -37,6 +42,7 @@ from .phase7_service import (
     save_parameter_profile,
     update_actual_bay_state,
     update_lo_statuses,
+    release_lo_dependencies,
     update_vehicle_states,
     upsert_bay_configuration,
     validate_job,
@@ -65,10 +71,22 @@ class LOStatusUpdate(BaseModel):
 
 class LOOperationalUpdateRequest(BaseModel):
     updates: list[LOStatusUpdate]
+    route_version_id: str | None = None
+
+
+class LOCreateRequest(BaseModel):
+    loading_order_id: str = Field(min_length=1, max_length=120)
+    spbu_id: str
+    product_id: str
+    volume_kl: float = Field(gt=0, allow_inf_nan=False)
+
+class LOCancelRequest(BaseModel):
+    loading_order_ids: list[str] = Field(min_length=1, max_length=5000)
 
 
 class VehicleStateUpdate(BaseModel):
     mt_id: str
+    disabled_tag_ids: list[str] | None = None
     planned_eta_depot: datetime | None = None
     operational_status: str | None = None
     working_time_limit_minutes: int | None = Field(default=None, ge=1, le=2880)
@@ -185,9 +203,34 @@ def phase7_loading_orders(job_id: str, db: Session = Depends(get_db)) -> list[di
     return list_job_los(db, job_id)
 
 
+@router.get("/jobs/{job_id}/loading-orders/options")
+def phase7_lo_options(job_id: str, db: Session = Depends(get_db)) -> list[dict]:
+    return job_lo_options(db, job_id)
+
+
+@router.post("/jobs/{job_id}/loading-orders", status_code=201)
+def phase7_add_lo(job_id: str, request: LOCreateRequest, db: Session = Depends(get_db)) -> dict:
+    return add_job_lo(db, job_id, request.model_dump())
+
+
+@router.post("/jobs/{job_id}/loading-orders/cancel")
+def phase7_cancel_los(job_id: str, request: LOCancelRequest, db: Session = Depends(get_db)) -> dict:
+    return cancel_job_los(db, job_id, request.loading_order_ids)
+
+
 @router.patch("/jobs/{job_id}/loading-orders/status")
 def phase7_update_loading_orders(job_id: str, request: LOOperationalUpdateRequest, db: Session = Depends(get_db)) -> dict:
-    return update_lo_statuses(db, job_id, [row.model_dump(mode="json") for row in request.updates])
+    return update_lo_statuses(db, job_id, [row.model_dump(mode="json") for row in request.updates], route_version_id=request.route_version_id)
+
+
+@router.post("/jobs/{job_id}/loading-orders/release-dependency")
+def phase7_release_dependency(job_id: str, request: LOCancelRequest, db: Session = Depends(get_db)) -> dict:
+    return release_lo_dependencies(db, job_id, request.loading_order_ids)
+
+
+@router.post("/jobs/{job_id}/loading-orders/release-freeze-window")
+def phase7_release_freeze_window(job_id: str, request: LOCancelRequest, db: Session = Depends(get_db)) -> dict:
+    return release_lo_dependencies(db, job_id, request.loading_order_ids, freeze_window=True)
 
 
 @router.post("/jobs/{job_id}/vehicles/load-master")
@@ -203,6 +246,16 @@ def phase7_vehicles(job_id: str, db: Session = Depends(get_db)) -> list[dict]:
 @router.patch("/jobs/{job_id}/vehicles")
 def phase7_update_vehicles(job_id: str, request: VehicleOperationalUpdateRequest, db: Session = Depends(get_db)) -> dict:
     return update_vehicle_states(db, job_id, [row.model_dump(mode="json", exclude_unset=True) for row in request.updates])
+
+
+@router.get("/jobs/{job_id}/vehicles/readiness/template")
+def phase7_readiness_template(job_id: str, db: Session = Depends(get_db)) -> Response:
+    return Response(readiness_template(db, job_id), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="MT_Readiness.xlsx"'})
+
+
+@router.post("/jobs/{job_id}/vehicles/readiness/import")
+def phase7_import_readiness(job_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
+    return import_readiness(db, job_id, file.file.read(), file.filename or "")
 
 
 @router.get("/depots/{depot_id}/bays")

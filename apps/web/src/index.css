@@ -2630,6 +2630,74 @@ div.border.border-line.bg-white.p-5 {
   padding-left: 9px;
 }
 
+.phase7-trip-head {
+  flex-wrap: wrap;
+}
+
+.phase7-trip-head > div {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.phase7-trip-status {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.phase7-trip-status > span {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.phase7-trip-status select {
+  width: 132px;
+  min-height: 30px;
+  height: 30px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background-color: #fff;
+  color: #334155;
+  padding: 4px 24px 4px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 150ms, box-shadow 150ms;
+}
+
+.phase7-trip-status.is-planned select {
+  color: #1d4ed8;
+  border-color: #bfdbfe;
+  background-color: #eff6ff;
+}
+
+.phase7-trip-status.is-ongoing select {
+  color: #92400e;
+  border-color: #fde68a;
+  background-color: #fffbeb;
+}
+
+.phase7-trip-status.is-done select {
+  color: #047857;
+  border-color: #a7f3d0;
+  background-color: #ecfdf5;
+}
+
+.phase7-trip-status select:focus-visible {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.phase7-trip-status select:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .phase7-timeline {
   display: flex;
   align-items: center;
@@ -3127,3 +3195,9 @@ div.border.border-line.bg-white.p-5 {
   .phase8-map { height: 430px; min-height: 430px; }
   .phase8-map-legend { grid-template-columns: 1fr; }
 }
+
+/* The selected depot scopes uploads and analysis throughout the workspace. */
+.topbar-depot-selector { display: flex; flex-direction: column; gap: 2px; min-width: 180px; max-width: 290px; }
+.topbar-depot-selector > span { font-size: 10px; font-weight: 700; text-transform: uppercase; color: #52667b; }
+.topbar-depot-selector select { width: 100%; border: 1px solid #d9e2e9; border-radius: 7px; padding: 7px 10px; background: white; color: #15385b; font-size: 13px; }
+@media (max-width: 640px) { .app-topbar-actions { flex-wrap: wrap; } .topbar-depot-selector { min-width: 130px; max-width: 180px; } }

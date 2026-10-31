@@ -1,69 +1,97 @@
 # Source Data Mapping
 
-## master data MT.xlsx
+## Depot aktif
 
-Sheet: `Mobil Tangki`
+Buat Master Depot, lalu pilih depot di top bar sebelah kiri Google Maps Settings.
+Semua upload MT, SPBU, dan Historikal Shipment memakai depot tersebut. File tidak
+memerlukan depot ID atau nama depot. Backend menyimpan depot pada import audit
+ketika job dibuat; kolom depot dari file lama tidak dapat mengganti konteks ini.
+API upload menerima depot_id sebagai parameter request (bukan kolom file).
 
-| Source column | Canonical target |
+## Mobil Tangki
+
+Sheet: Mobil Tangki. Gunakan template terbaru dari aplikasi.
+
+| Kolom | Makna |
 | --- | --- |
-| `id` | `master_mt.source_mt_id` |
-| `name` | `master_mt.vehicle_name_raw`, parsed to `vehicle_registration` and `capacity_label` |
-| `assignee` | `master_mt.assignee` |
-| `hubId` | `master_mt.source_hub_id`, `depot_identifier_alias.identifier_value` |
-| `vehicleType tag` | `master_mt.vehicle_type_tag` |
-| `project_tag` | `master_mt.project_tag_raw`, split to `master_tag` and `bridge_mt_tag` |
-| `numberOfCompartments` | `master_mt.number_of_compartments` |
-| `Depot` | `master_depot.depot_name`, `master_mt.depot_id`, depot alias |
+| vehicle_registration | Nomor registrasi kendaraan, dinormalisasi |
+| vehicle_type_tag | Vehicle Class sekaligus kapasitas KL (integer) |
+| project_tag | Daftar tag proyek |
+| number_of_compartments | Jumlah kompartemen |
+| active_status | ACTIVE / INACTIVE |
 
-## master data spbu.xlsx
+Vehicle name raw dan capacity label tidak perlu diisi. Nilai kapasitas analisis
+dan connector mengikuti vehicle_type_tag; capacity label lama hanya fallback.
 
-Sheet: `Lembaga Penyalur`
+## SPBU
 
-| Source column | Canonical target |
+Sheet: SPBU. SPBU code disimpan sebagai teks, termasuk angka nol di depan.
+
+| Kolom | Makna |
 | --- | --- |
-| `Nama SPBU` | `master_spbu.spbu_code`, `spbu_identifier_alias` as `SPBU_CODE` |
-| `Address` | `master_spbu.address` |
-| `Kota` | `master_spbu.city` |
-| `Coordinate` | `master_spbu.source_coordinate`, parsed to `latitude`, `longitude`, PostGIS `location` in migration |
-| `jarak_km` | `master_spbu.master_distance_km` |
-| `waktu_menit` | `master_spbu.master_travel_time_min` |
-| `Vehicle Type tag` | `master_spbu.vehicle_type_tag` |
-| `Project tag` | `master_spbu.project_tag_raw`, split to `master_tag` and `bridge_spbu_tag` |
-| `Depot` | `master_depot.depot_name`, `master_spbu.primary_depot_id`, depot alias |
+| spbu_code | Identitas SPBU; menggantikan nama duplikat |
+| address | Alamat tunggal; menggantikan city |
+| latitude, longitude | Koordinat numerik terpisah |
+| master_distance_km | Jarak referensi |
+| vehicle_type_tag, project_tag | Persyaratan kendaraan dan tag |
+| official_window_start, official_window_end | Jendela layanan |
+| active_status | ACTIVE / INACTIVE |
 
-`Nama SPBU` is stored as string. It is not cast to integer.
+Master travel time tidak dapat diisi manual. Sistem menggunakan:
 
-## masterdata_LO.xlsx
+- RTH = shipment_end_datetime - gate_out_datetime, dalam menit.
+- master_rth_min = median RTH shipment yang hanya memiliki satu SPBU terpetakan.
+- master_travel_time_min = master_rth_min / 2 (estimasi satu arah).
+- master_travel_time_sample_count = jumlah shipment, bukan jumlah baris produk.
 
-Sheet: `Data Medan Mei`
+Durasi nol/negatif, waktu kosong, shipment multi-SPBU, baris SPBU tak terpetakan,
+serta baris yang dihapus tidak menjadi sampel. Depot shipment harus sesuai depot
+SPBU. Tanpa sampel, nilai waktu NULL dan jumlah sampel 0. RTH masih memuat layanan
+dan waktu tunggu; estimasi ini bukan durasi mengemudi murni. Kolom hasil tersedia
+di tabel dan export, tetapi tidak perlu dimasukkan saat upload.
 
-| Source column | Canonical target |
+## Historikal Shipment
+
+Sheet: Historikal Shipment. Kode domain API LOADING_ORDER dipertahankan untuk
+kompatibilitas. Ini adalah data histori; input LO operasional Phase 6 tetap terpisah.
+
+| Kolom | Makna |
 | --- | --- |
-| `area_id` | `fact_shipment.area_id` |
-| `area` | `fact_shipment.area` |
-| `kode_depot` | `depot_identifier_alias`, `fact_shipment.depot_id` |
-| `tbbm` | `master_depot.depot_name`, `fact_shipment.depot_id`, and `fact_loading_order_line.source_depot_name` |
-| `shipment_id` | `fact_shipment.shipment_id` and `fact_shipment.source_shipment_id`; kept exactly as imported and used as the grouped shipment key |
-| `date` | `fact_shipment.operating_date` |
-| `date_validasi` + `Jam Validasi` | `fact_shipment.validation_datetime` |
-| `date_gate_out` + `Jam_gateout` | `fact_shipment.gate_out_datetime` |
-| `date_end_shipment` + `jam_end_shipment` | `fact_shipment.shipment_end_datetime` |
-| `nopol` | normalized and mapped to `master_mt.vehicle_registration`; stored on shipment |
-| `Vehicle Type tag` | `fact_shipment.vehicle_type_tag_observed` |
-| `Project tag` | `fact_shipment.project_tag_raw` |
-| `nama_spbu` | mapped to `master_spbu.spbu_code`; stored as `source_spbu_code` |
-| `shipto` | `fact_loading_order_line.shipto`, `spbu_identifier_alias` as `SHIPTO` |
-| `loading_order_number` | part of `fact_loading_order_line` composite primary key with `source_depot_name`; unique within the same `tbbm` |
-| `produk` | `master_product.product_name`, `fact_loading_order_line.source_product_name` |
-| `quantity` | `fact_loading_order_line.quantity` |
-| `supir_parent_id`, `supir`, `nip_supir` | `master_personnel` with role `DRIVER` |
-| `status` | `fact_shipment.status`, `fact_loading_order_line.status` |
-| `jarak_spbu` | `fact_loading_order_line.source_distance_km` |
-| `km_aktual` | `fact_loading_order_line.actual_km` |
-| `kernet_parent_id`, `kernet`, `nip_kernet` | `master_personnel` with role `ASSISTANT` |
+| shipment_id | Kunci shipment; semua baris satu shipment menggunakan ID sama |
+| loading_order_number | Nomor LO unik dalam depot |
+| vehicle_registration | Nomor kendaraan, dipetakan dalam depot aktif |
+| vehicle_type_tag, project_tag | Kelas/tag yang teramati pada shipment |
+| validation_datetime | Tanggal dan waktu validasi; wajib |
+| gate_out_datetime | Tanggal dan waktu keluar depot |
+| shipment_end_datetime | Tanggal dan waktu shipment selesai |
+| source_spbu_code | SPBU tujuan, dipetakan dalam depot aktif |
+| source_product_name | Nama produk lengkap; koma di dalam nama tidak memecah produk |
+| quantity | Kuantitas |
+| driver_name, driver_nip | Identitas pengemudi |
+| assistant_name, assistant_nip | Identitas kernet |
+| actual_km | Jarak aktual tunggal |
 
-Product names are preserved as full cell values. `PERTAMAX,BULK` is not split.
+Timestamp menggunakan YYYY-MM-DD HH:MM:SS pada zona waktu depot, atau ISO 8601
+dengan offset eksplisit. Tanggal operasional diturunkan dari validation_datetime.
+Status, source_distance_km, area_id, area, operating_date, shipto, serta tanggal
+atau jam terpisah tidak ada pada template/form baru. Shipment ID yang sudah
+terpakai pada depot berbeda ditolak agar data tidak berpindah depot.
 
-## GPS_data
+## Pembaruan dan kompatibilitas
 
-The physical schema is not available. Phase 0 includes `stg_gps_data`, `fact_gps_event`, geofence tables, visit tables, and stop sequence tables. Mapping must be completed only after the actual source columns are inspected.
+Import, edit, dan delete memperbarui relasi shipment-SPBU serta menghitung ulang
+waktu master. Analisis langsung membaca master canonical. Model, prediction,
+dan route tersimpan merupakan snapshot; jalankan ulang analisis atau buat run
+baru untuk memakai perubahan historikal.
+
+Kolom database lama dipertahankan sebagai mirror/fallback untuk integrasi dan
+histori. Nama MT mengikuti registration, capacity label mengikuti kelas numerik,
+nama SPBU mengikuti kode, city mengikuti address, dan source distance mengikuti
+actual km. Alias header file lama tetap dapat dibaca, tetapi template terbaru
+adalah kontrak input yang dianjurkan. Migration 0031 menyatukan nilai master lama
+dan menghitung RTH dari histori; lakukan backup sebelum migrasi.
+
+## GPS
+
+Mapping GPS tetap terpisah dari perubahan ini. Skema sumber aktual perlu ditinjau
+sebelum event GPS digunakan sebagai bukti urutan kunjungan.

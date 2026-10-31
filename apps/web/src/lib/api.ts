@@ -1,4 +1,4 @@
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
 export type SeriesPoint = { name: string; value: number };
 
@@ -22,8 +22,8 @@ export async function apiGet<T>(path: string): Promise<T> {
   return response.json();
 }
 
-export async function uploadImportFile(domain: string, sheetName: string, file: File): Promise<{ import_id: string; domain: string; status: string }> {
-  const params = new URLSearchParams({ domain, sheet_name: sheetName });
+export async function uploadImportFile(domain: string, sheetName: string, file: File, depotId: string): Promise<{ import_id: string; domain: string; status: string }> {
+  const params = new URLSearchParams({ domain, sheet_name: sheetName, depot_id: depotId });
   const body = new FormData();
   body.append("file", file);
   const response = await fetch(`${API_BASE_URL}/api/v1/imports?${params.toString()}`, {

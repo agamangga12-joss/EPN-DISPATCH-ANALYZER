@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import ReactECharts from "echarts-for-react";
 import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+import { API_BASE_URL } from "../lib/api";
 import {
   AlertTriangle,
   ArrowDown,
@@ -30,7 +31,6 @@ import {
 
 
 const API = "/api/v1/phase8/manual-dispatch";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 type DepotOption = { depot_id: string; depot_name: string };
 type Json = Record<string, any>;
@@ -149,8 +149,8 @@ export function ManualDispatchPage({ depots }: Props) {
   const [mapLoading, setMapLoading] = useState(false);
   const [mapError, setMapError] = useState("");
   const [unassignedFilters, setUnassignedFilters] = useState({ search: "", shift: "ALL", cluster: "ALL", product: "ALL", spbu: "ALL" });
-  const [listFilters, setListFilters] = useState({ depot: "", date: "", status: "", search: "", offset: 0 });
-  const [createForm, setCreateForm] = useState({ depot_id: "", operational_date: "", source_job_id: "", source_route_id: "", job_name: "" });
+  const [listFilters, setListFilters] = useState({ depot: depots[0]?.depot_id || "", date: "", status: "", search: "", offset: 0 });
+  const [createForm, setCreateForm] = useState({ depot_id: depots[0]?.depot_id || "", operational_date: "", source_job_id: "", source_route_id: "", job_name: "" });
 
   const handleError = useCallback((caught: unknown) => {
     setError(caught instanceof Error ? caught.message : "Unexpected error");
@@ -371,7 +371,7 @@ export function ManualDispatchPage({ depots }: Props) {
 
         <section className="phase8-card">
           <div className="phase8-filters">
-            <label><span>TBBM / Depot</span><select value={listFilters.depot} onChange={(event) => setListFilters({ ...listFilters, depot: event.target.value, offset: 0 })}><option value="">All Depots</option>{depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}</select></label>
+            <label><span>TBBM / Depot</span><select value={listFilters.depot} onChange={(event) => setListFilters({ ...listFilters, depot: event.target.value, offset: 0 })}>{depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}</select></label>
             <label><span>Operational Date</span><input type="date" value={listFilters.date} onChange={(event) => setListFilters({ ...listFilters, date: event.target.value, offset: 0 })} /></label>
             <label><span>Status</span><select value={listFilters.status} onChange={(event) => setListFilters({ ...listFilters, status: event.target.value, offset: 0 })}><option value="">All Status</option>{["DRAFT", "IN_PROGRESS", "READY", "FINALIZED"].map((value) => <option key={value}>{value}</option>)}</select></label>
             <label className="phase8-search"><span>Job ID / Job Name</span><div><Search size={15} /><input value={listFilters.search} onChange={(event) => setListFilters({ ...listFilters, search: event.target.value, offset: 0 })} placeholder="Search job..." /></div></label>

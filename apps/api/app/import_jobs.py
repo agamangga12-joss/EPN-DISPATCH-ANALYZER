@@ -51,7 +51,7 @@ def process_import(db: Session, import_id: str) -> None:
     try:
         if not path.is_file():
             raise ValueError("Uploaded import file is no longer available.")
-        processor = ImportProcessor(db)
+        processor = ImportProcessor(db, depot_id=audit.depot_id)
         if audit.domain == "MOBIL_TANGKI":
             processor.import_master_mt(
                 path,

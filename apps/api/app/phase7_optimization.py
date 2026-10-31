@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from .phase7_constants import constraint_is_hard, constraint_is_soft, constraint_penalty, constraint_rule
+from .phase7_timing import travel_time_matrix, trip_clock
 
 try:  # The production image installs OR-Tools; this guard keeps diagnostics import-safe.
     from ortools.constraint_solver import pywrapcp, routing_enums_pb2
@@ -214,6 +215,9 @@ class VRPOptimizationService:
             used = 0.0
             for node in allowed:
                 volume = float(remaining[node - 1]["volume_kl"])
+                previous = selected[-1] if selected else 0
+                if time_matrix[previous][node] >= 1_000_000_000 or time_matrix[node][0] >= 1_000_000_000:
+                    continue
                 if not constraint_is_hard(parameters, "vehicle_capacity") or used + volume <= capacity + 1e-9:
                     selected.append(node)
                     used += volume
@@ -284,16 +288,36 @@ class VRPOptimizationService:
         depot_close_minutes: int,
         parameters: dict,
     ) -> tuple[list[dict], set[int], str, float]:
+        if constraint_is_hard(parameters, "serve_loading_order") and any(
+            time_matrix[0][node] >= 1_000_000_000 or time_matrix[node][0] >= 1_000_000_000
+            for node in range(1, len(remaining) + 1)
+        ):
+            return [], set(), "INFEASIBLE", 0.0
         if not ORTOOLS_AVAILABLE:
             return self._fallback_round(remaining, vehicles, distance_matrix, time_matrix, day_start, parameters)
         manager = pywrapcp.RoutingIndexManager(len(remaining) + 1, len(vehicles), 0)
         routing = pywrapcp.RoutingModel(manager)
+        # Restricted-road no-route pairs are structural exclusions, independent
+        # of dispatcher HARD/SOFT time/capacity settings. Include every physical
+        # vehicle's separate start/end depot index, while retaining drop loops.
+        forbidden_pairs = [(i, j) for i, row in enumerate(time_matrix) for j, value in enumerate(row)
+                           if i != j and value >= 1_000_000_000]
+        if forbidden_pairs:
+            from_indexes, to_indexes = defaultdict(list), defaultdict(list)
+            for index in range(routing.Size() + len(vehicles)):
+                to_indexes[manager.IndexToNode(index)].append(index)
+                if index < routing.Size():
+                    from_indexes[manager.IndexToNode(index)].append(index)
+            for source, target in forbidden_pairs:
+                for source_index in from_indexes[source]:
+                    for target_index in to_indexes[target]:
+                        routing.NextVar(source_index).RemoveValue(target_index)
         service_minutes = int(parameters.get("default_spbu_service_minutes", 30))
 
         def minute_callback(from_index: int, to_index: int) -> int:
             source = manager.IndexToNode(from_index)
             target = manager.IndexToNode(to_index)
-            return math.ceil(time_matrix[source][target] / 60) + (service_minutes if source else 0)
+            return math.ceil(time_matrix[source][target] / 60) + (service_minutes if source else (int(parameters.get("refueling_minutes", 0)) if target else 0))
 
         minute_index = routing.RegisterTransitCallback(minute_callback)
         # Depot operating hours govern loading/gate-out, not the vehicle's
@@ -307,6 +331,28 @@ class VRPOptimizationService:
         time_horizon = max(depot_close_minutes + max(24 * 60, maximum_working_minutes), 1)
         routing.AddDimension(minute_index, 24 * 60, time_horizon, False, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
+
+        # A zero-slack driving dimension excludes service, refueling and waiting.
+        # Break counts depend on cumulative driving on the chosen route, not on
+        # elapsed wall time or separate arc rounding. Starts reset every trip.
+        break_minutes = int(parameters.get("driving_break_minutes", 0))
+        if break_minutes:
+            def driving_callback(from_index, to_index):
+                return int(time_matrix[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)])
+            driving_index = routing.RegisterTransitCallback(driving_callback)
+            routing.AddDimension(driving_index, 0, time_horizon * 60, True, "Driving")
+            driving = routing.GetDimensionOrDie("Driving")
+            cp = routing.solver()
+            interval = int(parameters.get("driving_break_interval_minutes", 240)) * 60
+            indexes = range(manager.GetNumberOfIndices())
+            drive_vars = [driving.CumulVar(i) for i in indexes]
+            break_counts = [cp.Max(value - 1, 0) // interval for value in drive_vars]
+            for index in range(routing.Size()):
+                next_breaks = cp.Element(break_counts, routing.NextVar(index))
+                # The Time dimension already enforces next = current + transit
+                # + slack. Express breaks as required slack, avoiding two extra
+                # N-wide Element constraints per node and a second time model.
+                cp.Add(time_dimension.SlackVar(index) >= (next_breaks - break_counts[index]) * break_minutes)
 
         def demand_callback(index: int) -> int:
             node = manager.IndexToNode(index)
@@ -331,6 +377,7 @@ class VRPOptimizationService:
         capacity_dimension = routing.GetDimensionOrDie("Capacity")
 
         objective = parameters["objective"]
+        use_elapsed_cost = bool(parameters.get("refueling_minutes", 0) or parameters.get("driving_break_minutes", 0))
         for vehicle_index, vehicle in enumerate(vehicles):
             def cost_callback(from_index: int, to_index: int, vehicle_index: int = vehicle_index) -> int:
                 source = manager.IndexToNode(from_index)
@@ -338,11 +385,11 @@ class VRPOptimizationService:
                 if objective == "MIN_TOTAL_DISTANCE":
                     base = distance_matrix[source][target]
                 elif objective == "MIN_TOTAL_OPERATING_TIME":
-                    base = math.ceil(time_matrix[source][target] / 60) * 1000
+                    base = 0 if use_elapsed_cost else math.ceil(time_matrix[source][target] / 60) * 1000
                 else:
                     base = round(
                         distance_matrix[source][target] / 1000 * float(parameters["cost_per_km"])
-                        + time_matrix[source][target] / 3600 * float(parameters["cost_per_operating_hour"])
+                        + (0 if use_elapsed_cost else time_matrix[source][target] / 3600 * float(parameters["cost_per_operating_hour"]))
                     )
                 if target:
                     target_lo = remaining[target - 1]
@@ -382,6 +429,11 @@ class VRPOptimizationService:
             cost_index = routing.RegisterTransitCallback(cost_callback)
             routing.SetArcCostEvaluatorOfVehicle(cost_index, vehicle_index)
             routing.SetFixedCostOfVehicle(self._vehicle_cost(parameters, vehicle), vehicle_index)
+            if use_elapsed_cost and objective != "MIN_TOTAL_DISTANCE":
+                # Charge elapsed route time once, including fuel, breaks and
+                # service. Drive-time costs are removed from the arc evaluator.
+                coefficient = 1000 if objective == "MIN_TOTAL_OPERATING_TIME" else max(0, round(float(parameters["cost_per_operating_hour"]) / 60))
+                time_dimension.SetSpanCostCoefficientForVehicle(coefficient, vehicle_index)
             reference_minutes = _minutes_between(day_start, vehicle.get("optimization_reference_time") or day_start)
             available_minutes = _minutes_between(day_start, vehicle.get("availability_eta_depot") or vehicle["effective_eta_depot"])
             depot_open_minutes = _minutes_between(day_start, vehicle.get("depot_operational_start") or day_start)
@@ -585,6 +637,7 @@ class VRPOptimizationService:
         depot_close: datetime,
         parameters: dict,
     ) -> dict:
+        time_matrix = travel_time_matrix(distance_matrix, time_matrix, parameters)
         solve_started = perf_counter()
         solve_time_limit = max(1, int(parameters.get("route_optimization_time_limit", parameters.get("optimization_time_limit", 30))))
         solve_deadline = solve_started + solve_time_limit
@@ -685,20 +738,32 @@ class VRPOptimizationService:
                         grouped_index[spbu_id] = len(grouped_stops)
                         grouped_stops.append((original_index[str(lo["loading_order_id"])], [lo]))
                 previous = 0
+                leg_times = []
+                for node, _ in grouped_stops:
+                    leg_times.append(int(time_matrix[previous][node]))
+                    previous = node
+                leg_times.append(int(time_matrix[previous][0]))
+                earliest_arrivals = [
+                    max(0, int(stop_los[0].get("time_window_start_minutes") or 0) * 60 - int((ready - _utc(day_start)).total_seconds()))
+                    if constraint_is_hard(parameters, "spbu_time_window") else 0
+                    for _, stop_los in grouped_stops
+                ]
+                timing = trip_clock(leg_times, int(parameters.get("default_spbu_service_minutes", 30)) * 60, parameters, earliest_arrivals)
+                previous = 0
                 drive_seconds = 0
                 stops = []
                 arrival = ready
                 for sequence, (node, stop_los) in enumerate(grouped_stops, start=1):
                     leg_seconds = int(time_matrix[previous][node])
                     drive_seconds += leg_seconds
-                    arrival += timedelta(seconds=leg_seconds)
-                    departure = arrival + timedelta(minutes=int(parameters.get("default_spbu_service_minutes", 30)))
+                    arrival = ready + timedelta(seconds=timing["arrival_offsets"][sequence - 1])
+                    departure = ready + timedelta(seconds=timing["departure_offsets"][sequence - 1])
                     stops.append({"sequence": sequence, "loading_order": stop_los[0], "loading_orders": stop_los, "arrival": arrival, "departure": departure, "leg_seconds": leg_seconds, "leg_distance_meters": int(distance_matrix[previous][node])})
                     arrival = departure
                     previous = node
                 return_seconds = int(time_matrix[previous][0])
                 drive_seconds += return_seconds
-                preliminary_return = arrival + timedelta(seconds=return_seconds)
+                preliminary_return = ready + timedelta(seconds=timing["total_seconds"])
                 distance_meters = sum(int(stop["leg_distance_meters"]) for stop in stops) + int(distance_matrix[previous][0])
                 operating_minutes = _minutes_between(ready, preliminary_return)
                 if (
@@ -708,6 +773,12 @@ class VRPOptimizationService:
                 ):
                     # The time dimension normally prevents this; retain an explicit
                     # guard for fallback matrices and post-compartment validation.
+                    continue
+                if constraint_is_hard(parameters, "spbu_time_window") and any(
+                    stop["loading_order"].get("time_window_start_minutes") is not None
+                    and stop["loading_order"].get("time_window_end_minutes") is not None
+                    and not int(stop["loading_order"]["time_window_start_minutes"]) <= _minutes_between(day_start, stop["arrival"]) <= int(stop["loading_order"]["time_window_end_minutes"])
+                    for stop in stops):
                     continue
                 constraint_violations = list(compartment_result.get("constraint_violations") or [])
                 selected_volume = sum(float(lo["volume_kl"]) for lo in route_los)
@@ -764,6 +835,7 @@ class VRPOptimizationService:
                     "estimated_return_depot": preliminary_return,
                     "distance_meters": distance_meters,
                     "driving_seconds": drive_seconds,
+                    "trip_timing": timing,
                     "service_seconds": len(stops) * int(parameters.get("default_spbu_service_minutes", 30)) * 60,
                     "operating_minutes": operating_minutes,
                     "stops": stops,
@@ -790,6 +862,10 @@ class VRPOptimizationService:
             if lo.get("user_cancelled"):
                 code = "USER_CANCELLED"
                 description = "LO was cancelled by the dispatcher and is excluded from routing."
+            elif (time_matrix[0][original_index[str(lo["loading_order_id"])]] >= 1_000_000_000
+                  or time_matrix[original_index[str(lo["loading_order_id"])]][0] >= 1_000_000_000):
+                code = "RESTRICTED_ROUTE_REVIEW_REQUIRED"
+                description = "Configured Google waypoint candidates did not yield a permitted route. Review the detour; other road alternatives may still exist."
             elif not lo.get("allowed_vehicle_ids"):
                 code = "NO_COMPATIBLE_MT"
                 description = "No active depot MT passes vehicle-class and master-tag compatibility for this SPBU."

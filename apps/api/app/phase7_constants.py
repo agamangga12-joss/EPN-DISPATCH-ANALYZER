@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 
-PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v6"
+PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v9"
 
 JOB_STATUSES = {"DRAFT", "READY", "CALCULATING", "COMPLETED", "ACTIVE", "CLOSED", "FAILED"}
 LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
@@ -23,6 +23,8 @@ DROPPED_REASON_CODES = {
     "BAY_WINDOW_EXHAUSTED",
     "POST_BAY_REASSIGNMENT_TIMEOUT",
     "NO_FEASIBLE_ROUTE",
+    "RESTRICTED_ROAD_NO_ROUTE",
+    "RESTRICTED_ROUTE_REVIEW_REQUIRED",
     "USER_CANCELLED",
     "UNSERVED_END_OF_DAY",
 }
@@ -278,6 +280,11 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "return_time_tolerance_minutes": 5,
     "maximum_trips_per_mt": 6,
     "mt_turnaround_buffer_minutes": 30,
+    "travel_time_mode": "AUTO",
+    "average_speed_kmh": 35.0,
+    "refueling_minutes": 40,
+    "driving_break_interval_minutes": 240,
+    "driving_break_minutes": 30,
     "default_spbu_service_minutes": 30,
     "cost_per_km": 10_000.0,
     "cost_per_operating_hour": 50_000.0,
@@ -303,6 +310,8 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "route_matrix_cache_enabled": True,
     "route_matrix_cache_ttl_minutes": 60,
     "route_matrix_time_limit_seconds": 90,
+    "restricted_matrix_time_limit_seconds": 900,
+    "restricted_matrix_workers": 4,
     "route_matrix_google_element_budget": 2500,
     "route_geometry_time_limit_seconds": 120,
     "route_geometry_google_request_budget": 500,
@@ -395,7 +404,16 @@ def effective_parameters(overrides: dict | None = None) -> dict:
     ).upper()
     if parameters["bay_scheduler_strategy"] not in {"FIFO_BALANCED", "CP_SAT"}:
         raise ValueError("bay_scheduler_strategy must be FIFO_BALANCED or CP_SAT")
+    if parameters["travel_time_mode"] not in {"AUTO", "MANUAL_SPEED"}:
+        raise ValueError("travel_time_mode must be AUTO or MANUAL_SPEED")
+    speed = float(parameters["average_speed_kmh"])
+    if not math.isfinite(speed) or not 1 <= speed <= 150:
+        raise ValueError("average_speed_kmh must be between 1 and 150")
+    parameters["average_speed_kmh"] = speed
     integer_bounds = {
+        "refueling_minutes": (0, 1440),
+        "driving_break_interval_minutes": (1, 1440),
+        "driving_break_minutes": (0, 1440),
         "freeze_window_minutes": (0, 1440),
         "reoptimization_interval_minutes": (1, 1440),
         "optimization_time_limit": (1, 3600),
@@ -411,6 +429,8 @@ def effective_parameters(overrides: dict | None = None) -> dict:
         "gate_process_time": (0, 240),
         "route_matrix_cache_ttl_minutes": (1, 10080),
         "route_matrix_time_limit_seconds": (1, 900),
+        "restricted_matrix_time_limit_seconds": (1, 3600),
+        "restricted_matrix_workers": (1, 16),
         "route_matrix_google_element_budget": (0, 3000),
         "route_geometry_time_limit_seconds": (0, 300),
         "route_geometry_google_request_budget": (0, 500),

@@ -275,7 +275,7 @@ def vehicle_record(row: MasterMT, tags: list[str], state: VehicleOperationalStat
         "terminal_id": row.depot_id,
         "vehicle_code": row.source_mt_id,
         "vehicle_number": row.vehicle_registration,
-        "vehicle_class": row.capacity_label or (f"{row.vehicle_type_tag}KL" if row.vehicle_type_tag is not None else None),
+        "vehicle_class": f"{row.vehicle_type_tag}KL" if row.vehicle_type_tag is not None else row.capacity_label,
         "capacity_kl": capacity,
         "compartment_count": compartment_count,
         "compartments": compartments,

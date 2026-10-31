@@ -11,6 +11,7 @@ import { GoogleMapsIntegrationPage } from "./components/GoogleMapsIntegrationPag
 import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { DocumentationPage } from "./components/DocumentationPage";
 import { Phase7OptimizationPage } from "./components/Phase7OptimizationPage";
+import { RestrictedRoadsPage } from "./components/RestrictedRoadsPage";
 import { ManualDispatchPage } from "./components/ManualDispatchPage";
 import { RouteModelAlignmentPage } from "./components/RouteModelAlignmentPage";
 import { AmtSchedulerConnectorPage } from "./components/AmtSchedulerConnectorPage";
@@ -18,6 +19,7 @@ import { AmtSchedulerConnectorPage } from "./components/AmtSchedulerConnectorPag
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
 type ImportAudit = {
+  depot_id?: string | null;
   import_id: string;
   domain: string;
   filename: string;
@@ -51,6 +53,7 @@ type CompatibilitySummary = {
 };
 type Depot = {
   depot_id: string;
+  active_status?: string;
   depot_code: string | null;
   depot_name: string;
 };
@@ -96,10 +99,11 @@ const pageMetadata: Record<Page, { eyebrow: string; title: string; description: 
     title: "Dashboard",
     description: "Data foundation overview and operational intelligence summary.",
   },
+  "restricted-roads": { eyebrow: "Data Foundation", title: "Master Restricted Roads", description: "Kelola ruas jalan terlarang per depot untuk routing Dynamic VRP." },
   "master-data": {
     eyebrow: "Data Foundation",
     title: "Master Data Management",
-    description: "Manage canonical MT, SPBU, depot, product, tag, and loading-order records.",
+    description: "Kelola MT, SPBU, historikal shipment, depot, produk, dan tag sesuai depot aktif.",
   },
   "tag-consistency": {
     eyebrow: "Data Foundation",
@@ -593,8 +597,8 @@ function tagTypeColumnKey(code: string): string {
 
 function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudDomainConfig> {
   const requiredDepotOptions = depots.map((depot) => ({ label: depot.depot_name, value: depot.depot_id }));
-  const mtTagColumns = tagTypes.map((tagType) => tagTypeColumnKey(tagType.code));
-  const spbuTagColumns = tagTypes.map((tagType) => tagTypeColumnKey(tagType.code));
+  const mtTagColumns = [...new Set(["tag_vehicle_class", ...tagTypes.map((tagType) => tagTypeColumnKey(tagType.code))])];
+  const spbuTagColumns = mtTagColumns;
   const editableTagFields = tagTypes
     .filter((tagType) => tagType.code !== "VEHICLE_CLASS")
     .map((tagType) => ({
@@ -612,86 +616,53 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
   ];
   return {
     MOBIL_TANGKI: {
-      label: "Mobil Tangki",
-      idKey: "mt_id",
-      titleKey: "vehicle_registration",
-      depotFilter: true,
-      columns: ["depot_id", "vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", ...mtTagColumns, "active_status"],
+      label: "Mobil Tangki", idKey: "mt_id", titleKey: "vehicle_registration", depotFilter: true,
+      columns: ["vehicle_registration", "number_of_compartments", ...mtTagColumns, "active_status"],
       fields: [
-        { key: "vehicle_name_raw", label: "Raw Name", required: true },
-        { key: "vehicle_registration", label: "Registration", readonlyOnEdit: true },
-        { key: "capacity_label", label: "Capacity" },
-        { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
+        { key: "vehicle_registration", label: "Vehicle Registration", required: true, readonlyOnEdit: true },
+        { key: "vehicle_type_tag", label: "Tag Vehicle Class / Kapasitas (KL)", kind: "number" },
         ...editableTagFields,
         { key: "number_of_compartments", label: "Compartments", kind: "number" },
-        { key: "depot_id", label: "Depot", kind: "select", options: requiredDepotOptions, required: true, readonlyOnEdit: true },
         { key: "assignee", label: "Assignee" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
       ]
     },
     SPBU: {
-      label: "SPBU",
-      idKey: "spbu_id",
-      titleKey: "spbu_code",
-      depotFilter: true,
-      columns: ["primary_depot_id", "spbu_code", "city", "source_coordinate", "latitude", "longitude", "official_window_start", "official_window_end", ...spbuTagColumns, "active_status"],
+      label: "SPBU", idKey: "spbu_id", titleKey: "spbu_code", depotFilter: true,
+      columns: ["spbu_code", "address", "latitude", "longitude", "master_distance_km", "master_rth_min", "master_travel_time_min", "master_travel_time_sample_count", "official_window_start", "official_window_end", ...spbuTagColumns, "active_status"],
       fields: [
         { key: "spbu_code", label: "SPBU Code", required: true, readonlyOnEdit: true },
-        { key: "spbu_name", label: "Name" },
         { key: "address", label: "Address", kind: "textarea" },
-        { key: "city", label: "City" },
-        { key: "source_coordinate", label: "Coordinate" },
         { key: "latitude", label: "Latitude", kind: "number" },
         { key: "longitude", label: "Longitude", kind: "number" },
         { key: "master_distance_km", label: "Distance KM", kind: "number" },
-        { key: "master_travel_time_min", label: "Travel Time Min", kind: "number" },
         { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
         ...editableTagFields,
-        { key: "primary_depot_id", label: "Depot", kind: "select", options: requiredDepotOptions, required: true, readonlyOnEdit: true },
         { key: "official_window_start", label: "Official Window Start", kind: "time", required: true, defaultValue: "00:00" },
         { key: "official_window_end", label: "Official Window End", kind: "time", required: true, defaultValue: "23:59" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
       ]
     },
     LOADING_ORDER: {
-      label: "Loading Order",
-      idKey: "crud_record_id",
-      titleKey: "loading_order_number",
-      depotFilter: true,
-      statusFilter: false,
-      columns: [
-        "depot_id",
-        "loading_order_number",
-        "source_depot_name",
-        "shipment_id",
-        "vehicle_registration",
-        "driver_name",
-        "driver_nip",
-        "assistant_name",
-        "assistant_nip",
-        "validation_date",
-        "validation_time",
-        "shipment_end_date",
-        "shipment_end_time",
-        "source_spbu_code",
-        "shipto",
-        "source_product_name",
-        "quantity",
-        "status"
-      ],
+      label: "Historikal Shipment", idKey: "crud_record_id", titleKey: "loading_order_number", depotFilter: true, statusFilter: false,
+      columns: ["loading_order_number", "shipment_id", "vehicle_registration", "driver_name", "driver_nip", "assistant_name", "assistant_nip", "validation_datetime", "gate_out_datetime", "shipment_end_datetime", "source_spbu_code", "source_product_name", "quantity", "actual_km"],
       fields: [
-        { key: "depot_id", label: "Depot", kind: "select", options: requiredDepotOptions, required: true, readonlyOnEdit: true },
         { key: "loading_order_number", label: "Loading Order Number", required: true, readonlyOnEdit: true },
-        { key: "source_depot_name", label: "Depot Name (TBBM)", required: true, readonlyOnEdit: true },
-        { key: "shipment_id", label: "Shipment ID", required: true },
-        { key: "source_spbu_code", label: "Source SPBU Code" },
-        { key: "shipto", label: "Ship To" },
-        { key: "product_id", label: "Product ID" },
-        { key: "source_product_name", label: "Source Product Name" },
+        { key: "shipment_id", label: "Shipment ID", required: true, readonlyOnEdit: true },
+        { key: "vehicle_registration", label: "Vehicle Registration" },
+        { key: "vehicle_type_tag", label: "Vehicle Class Teramati (KL)", kind: "number" },
+        { key: "project_tag", label: "Project Tag Teramati" },
+        { key: "validation_datetime", label: "Validation (YYYY-MM-DD HH:MM:SS)", required: true },
+        { key: "gate_out_datetime", label: "Gate Out (YYYY-MM-DD HH:MM:SS)" },
+        { key: "shipment_end_datetime", label: "Shipment End (YYYY-MM-DD HH:MM:SS)" },
+        { key: "source_spbu_code", label: "SPBU Code" },
+        { key: "source_product_name", label: "Product Name" },
         { key: "quantity", label: "Quantity", kind: "number" },
-        { key: "status", label: "Operational Status" },
-        { key: "source_distance_km", label: "Source Distance KM", kind: "number" },
-        { key: "actual_km", label: "Actual KM", kind: "number" }
+        { key: "actual_km", label: "Actual KM", kind: "number" },
+        { key: "driver_name", label: "Driver Name" },
+        { key: "driver_nip", label: "Driver NIP" },
+        { key: "assistant_name", label: "Assistant Name" },
+        { key: "assistant_nip", label: "Assistant NIP" }
       ]
     },
     DEPOT: {
@@ -759,7 +730,8 @@ function crudColumnLabel(column: string): string {
     shipment_end_time: "Waktu Endshipment",
     vehicle_registration: "Vehicle Registration"
   };
-  return labels[column] ?? column.replace(/_/g, " ");
+  const historicalLabels: Record<string, string> = { master_rth_min: "Median RTH (min)", master_travel_time_min: "Estimasi Satu Arah (min)", master_travel_time_sample_count: "Sampel RTH", validation_datetime: "Validation", gate_out_datetime: "Gate Out", shipment_end_datetime: "Shipment End", tag_vehicle_class: "Vehicle Class / Kapasitas (KL)" };
+  return historicalLabels[column] ?? labels[column] ?? column.replace(/_/g, " ");
 }
 
 function formatCrudValue(value: unknown, column?: string): string {
@@ -880,6 +852,7 @@ function monthLabel(value: Date): string {
 }
 
 function pageFromPath(pathname: string): Page {
+  if (pathname === "/master-data/restricted-roads") return "restricted-roads";
   if (pathname === "/master-data") return "master-data";
   if (pathname === "/tag-consistency") return "tag-consistency";
   if (pathname === "/departure-intelligence") return "departure-intelligence";
@@ -1182,6 +1155,18 @@ function initialTagConsistencyFilters(): TagConsistencyFilters {
 }
 
 function App() {
+  const [activeDepotId, setActiveDepotId] = useState(() => window.localStorage.getItem("dispatch-active-depot") || "");
+  function chooseDepot(depotId: string) {
+    window.localStorage.setItem("dispatch-active-depot", depotId);
+    let path = window.location.pathname;
+    if (path.startsWith("/phase-8/manual-dispatch/")) path = "/phase-8/manual-dispatch";
+    window.history.replaceState({}, "", path);
+    setActiveDepotId(depotId);
+  }
+  return <DepotWorkspace key={activeDepotId} activeDepotId={activeDepotId} onDepotChange={chooseDepot} />;
+}
+
+function DepotWorkspace({ activeDepotId, onDepotChange }: { activeDepotId: string; onDepotChange: (id: string) => void }) {
   const [currentPage, setCurrentPage] = useState<Page>(() => pageFromPath(window.location.pathname));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.localStorage.getItem("dispatch-sidebar-collapsed") === "true");
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -1189,7 +1174,8 @@ function App() {
   const [charts, setCharts] = useState<Charts>({});
   const [imports, setImports] = useState<ImportAudit[]>([]);
   const [issues, setIssues] = useState<QualityIssue[]>([]);
-  const [depots, setDepots] = useState<Depot[]>([]);
+  const [allDepots, setDepots] = useState<Depot[]>([]);
+  const depots = useMemo(() => allDepots.filter((depot) => depot.depot_id === activeDepotId), [allDepots, activeDepotId]);
   const [products, setProducts] = useState<Product[]>([]);
   const [tagTypes, setTagTypes] = useState<TagType[]>([]);
   const [compatibility, setCompatibility] = useState<CompatibilitySummary | null>(null);
@@ -1203,9 +1189,9 @@ function App() {
   const [domain, setDomain] = useState("MOBIL_TANGKI");
   const [sheetName, setSheetName] = useState("Mobil Tangki");
   const [exportDomain, setExportDomain] = useState("ALL");
-  const [exportDepotId, setExportDepotId] = useState("");
+  const [exportDepotId, setExportDepotId] = useState(activeDepotId);
   const [exportFormat, setExportFormat] = useState("xlsx");
-  const [dashboardDepotId, setDashboardDepotId] = useState("ALL");
+  const [dashboardDepotId, setDashboardDepotId] = useState(activeDepotId);
   const [crudDomain, setCrudDomain] = useState("MOBIL_TANGKI");
   const [crudRows, setCrudRows] = useState<Array<Record<string, unknown>>>([]);
   const [crudTotal, setCrudTotal] = useState(0);
@@ -1217,15 +1203,17 @@ function App() {
   const [crudAppliedSearchColumn, setCrudAppliedSearchColumn] = useState("vehicle_registration");
   const [crudSortColumn, setCrudSortColumn] = useState("vehicle_registration");
   const [crudSortDirection, setCrudSortDirection] = useState<CrudSortDirection>("asc");
-  const [crudDepotId, setCrudDepotId] = useState("ALL");
+  const [crudDepotId, setCrudDepotId] = useState(activeDepotId);
   const [crudModalMode, setCrudModalMode] = useState<CrudModalMode>(null);
   const [crudBatchForms, setCrudBatchForms] = useState<CrudBatchFormRow[]>([]);
   const [selectedCrudIds, setSelectedCrudIds] = useState<Set<string>>(() => new Set());
   const [crudLoading, setCrudLoading] = useState(false);
   const [crudSyncing, setCrudSyncing] = useState(false);
-  const [tagFilters, setTagFilters] = useState<TagConsistencyFilters>(initialTagConsistencyFilters);
+  const [tagFilters, setTagFilters] = useState<TagConsistencyFilters>(() => ({ ...initialTagConsistencyFilters(), depotId: activeDepotId }));
   const [tagAnalysis, setTagAnalysis] = useState<TagConsistencyResponse | null>(null);
   const [tagLoading, setTagLoading] = useState(false);
+  const [tagExporting, setTagExporting] = useState(false);
+  const [tagExportParams, setTagExportParams] = useState<string | null>(null);
   const [tagOffset, setTagOffset] = useState(0);
   const [tagLimit, setTagLimit] = useState(25);
   const [tagSortColumn, setTagSortColumn] = useState("loading_order_date");
@@ -1239,7 +1227,7 @@ function App() {
   const [mtMismatchSortDirection, setMtMismatchSortDirection] = useState<CrudSortDirection>("desc");
   const [selectedAnalysis, setSelectedAnalysis] = useState<TagConsistencyRow | null>(null);
   const [departureFilters, setDepartureFilters] = useState<DepartureFilters>({
-    depotId: "",
+    depotId: activeDepotId,
     startDate: "",
     endDate: "",
     bucketMinutes: "30",
@@ -1275,7 +1263,7 @@ function App() {
   const [shiftSummaryFilter, setShiftSummaryFilter] = useState<ShiftSummaryFilter>("ALL");
   const [boxPlotHighlightBy, setBoxPlotHighlightBy] = useState<"NONE" | "PRIMARY_SHIFT" | "ASSIGNMENT_STATUS" | "CONFIDENCE">("NONE");
   const [pairingFilters, setPairingFilters] = useState<PairingFilters>({
-    depotId: "",
+    depotId: activeDepotId,
     rangePreset: "30",
     startDate: "",
     endDate: "",
@@ -1313,6 +1301,7 @@ function App() {
   const activeCrudConfig = configs[crudDomain];
 
   async function fetchCrud() {
+    if (activeCrudConfig.depotFilter && !activeDepotId) { setCrudRows([]); setCrudTotal(0); return; }
     const requestId = crudRequestRef.current + 1;
     crudRequestRef.current = requestId;
     setCrudLoading(true);
@@ -1373,6 +1362,13 @@ function App() {
       const payload = await apiGet<TagConsistencyResponse>(`/api/v1/tag-consistency/analysis?${params.toString()}`);
       if (tagRequestRef.current === requestId) {
         setTagAnalysis(payload);
+        // Capture the successful table scope, including its effective default dates.
+        for (const [key, value] of Object.entries(payload.effective_filters)) {
+          if (value !== null) params.set(key, String(value));
+        }
+        params.delete("limit");
+        params.delete("offset");
+        setTagExportParams(params.toString());
       }
     } catch (err) {
       if (tagRequestRef.current === requestId) {
@@ -1382,6 +1378,21 @@ function App() {
       if (tagRequestRef.current === requestId) {
         setTagLoading(false);
       }
+    }
+  }
+
+  async function handleExportTagAnalysis() {
+    if (!tagExportParams || tagExporting) return;
+    setTagExporting(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams(tagExportParams);
+      params.set("export_excel", "true");
+      await downloadFromApi(`/api/v1/tag-consistency/analysis?${params.toString()}`, "tag_consistency.xlsx");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Tag consistency export failed");
+    } finally {
+      setTagExporting(false);
     }
   }
 
@@ -1621,6 +1632,13 @@ function App() {
 
   async function refresh() {
     setError(null);
+    const available = await apiGet<Depot[]>("/api/v1/master/depots");
+    setDepots(available);
+    if (!available.some((depot) => depot.depot_id === activeDepotId && depot.active_status === "ACTIVE")) {
+      const next = available.find((depot) => depot.active_status === "ACTIVE")?.depot_id || "";
+      if (next !== activeDepotId) onDepotChange(next);
+      return;
+    }
     const dashboardParams = dashboardDepotId !== "ALL" ? `?depot_id=${encodeURIComponent(dashboardDepotId)}` : "";
     const issueParams = new URLSearchParams({ limit: "20" });
     if (dashboardDepotId !== "ALL") issueParams.set("depot_id", dashboardDepotId);
@@ -1629,7 +1647,7 @@ function App() {
     const [overviewData, chartData, importData, issueData, depotData, tagTypeData, productData] = await Promise.all([
       apiGet<Overview>(`/api/v1/foundation/overview${dashboardParams}`),
       apiGet<Charts>(`/api/v1/foundation/charts${dashboardParams}`),
-      apiGet<ImportAudit[]>("/api/v1/imports"),
+      apiGet<ImportAudit[]>(`/api/v1/imports?depot_id=${encodeURIComponent(activeDepotId)}`),
       apiGet<QualityIssue[]>(`/api/v1/data-quality/issues?${issueParams.toString()}`),
       apiGet<Depot[]>("/api/v1/master/depots"),
       apiGet<CrudResponse>("/api/v1/master-crud/TAG_TYPE?limit=10000"),
@@ -1669,7 +1687,7 @@ function App() {
         if (cancelled) return;
         const nextStatus = payload.import.status;
         setActiveImportStatus(nextStatus);
-        setImports((current) => [
+        if (payload.import.depot_id === activeDepotId) setImports((current) => [
           payload.import,
           ...current.filter((item) => item.import_id !== payload.import.import_id)
         ].slice(0, 8));
@@ -2032,7 +2050,7 @@ function App() {
     const defaultSheets: Record<string, string> = {
       MOBIL_TANGKI: "Mobil Tangki",
       SPBU: "SPBU",
-      LOADING_ORDER: "Data Medan Mei",
+      LOADING_ORDER: "Historikal Shipment",
       GPS: ""
     };
     setSheetName(defaultSheets[nextDomain] ?? "");
@@ -2042,10 +2060,11 @@ function App() {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
+    if (!activeDepotId) { setError("Pilih depot aktif di top bar sebelum upload."); return; }
     setUploading(true);
     setError(null);
     try {
-      const queued = await uploadImportFile(domain, sheetName || "Sheet1", file);
+      const queued = await uploadImportFile(domain, sheetName || "Sheet1", file, activeDepotId);
       window.localStorage.setItem("dispatch-active-import-id", queued.import_id);
       setActiveImportId(queued.import_id);
       setActiveImportStatus(queued.status);
@@ -2093,6 +2112,7 @@ function App() {
   }
 
   function openCrudAddModal() {
+    if (activeCrudConfig.depotFilter && !activeDepotId) { setError("Pilih depot aktif terlebih dahulu."); return; }
     setError(null);
     setCrudModalMode("add");
     setCrudBatchForms([{ values: emptyCrudValues(activeCrudConfig) }]);
@@ -2154,9 +2174,9 @@ function App() {
       for (const formRow of crudBatchForms) {
         if (crudModalMode === "edit") {
           if (!formRow.recordId) continue;
-          await apiSend(`/api/v1/master-crud/${crudDomain}/${encodeURIComponent(formRow.recordId)}`, "PUT", formRow.values);
+          await apiSend(`/api/v1/master-crud/${crudDomain}/${encodeURIComponent(formRow.recordId)}`, "PUT", { ...formRow.values, depot_id: activeDepotId, primary_depot_id: activeDepotId });
         } else {
-          await apiSend(`/api/v1/master-crud/${crudDomain}`, "POST", formRow.values);
+          await apiSend(`/api/v1/master-crud/${crudDomain}`, "POST", { ...formRow.values, depot_id: activeDepotId, primary_depot_id: activeDepotId });
         }
       }
       closeCrudModal();
@@ -2241,7 +2261,7 @@ function App() {
     const cleared = {
       startDate: "",
       endDate: "",
-      depotId: "ALL",
+      depotId: activeDepotId,
       spbu: "",
       vehicle: "",
       tagType: "ALL",
@@ -2707,7 +2727,7 @@ function App() {
 
   function navigate(page: Page) {
     const path =
-      page === "master-data"
+      page === "restricted-roads" ? "/master-data/restricted-roads" : page === "master-data"
         ? "/master-data"
         : page === "tag-consistency"
           ? "/tag-consistency"
@@ -2779,6 +2799,13 @@ function App() {
             </div>
           </div>
           <div className="app-topbar-actions">
+            <label className="topbar-depot-selector">
+              <span>Depot Aktif</span>
+              <select aria-label="Depot aktif" value={activeDepotId} disabled={uploading} onChange={(event) => onDepotChange(event.target.value)}>
+                {!activeDepotId && <option value="">Pilih depot</option>}
+                {allDepots.filter((depot) => depot.active_status === "ACTIVE").map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}
+              </select>
+            </label>
             <button
               type="button"
               className="topbar-settings-button"
@@ -2806,6 +2833,7 @@ function App() {
             </section>
           )}
         {error && <div className="mb-4 border border-rust bg-white px-4 py-3 text-sm text-rust">{error}</div>}
+        {!activeDepotId && <div className="mb-4 border border-line bg-white px-4 py-3 text-sm">Belum ada depot aktif. Buat depot terlebih dahulu untuk mulai mengunggah data dan membuka analisis. <button className="ml-2 font-semibold text-ocean underline" onClick={() => { navigate("master-data"); changeCrudDomain("DEPOT"); }}>Kelola Depot</button></div>}
         {shiftHelpOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
             <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto border border-line bg-white p-5 shadow-card">
@@ -2995,31 +3023,31 @@ function App() {
           </section>
         )}
 
-        {currentPage === "affinity-intelligence" && (
+        {currentPage === "affinity-intelligence" && depots.length > 0 && (
           <AffinityIntelligencePage depots={depots} products={products} />
         )}
 
-        {currentPage === "machine-learning-intelligence" && (
+        {currentPage === "machine-learning-intelligence" && depots.length > 0 && (
           <MachineLearningIntelligencePage depots={depots} />
         )}
 
-        {currentPage === "prediction-assignment" && (
+        {currentPage === "prediction-assignment" && depots.length > 0 && (
           <PredictionAssignmentPage depots={depots} products={products} />
         )}
 
-        {currentPage === "phase7-optimization" && (
+        {currentPage === "phase7-optimization" && depots.length > 0 && (
           <Phase7OptimizationPage depots={depots} products={products} />
         )}
 
-        {currentPage === "manual-dispatch" && (
+        {currentPage === "manual-dispatch" && depots.length > 0 && (
           <ManualDispatchPage depots={depots} />
         )}
 
-        {currentPage === "route-model-alignment" && (
+        {currentPage === "route-model-alignment" && depots.length > 0 && (
           <RouteModelAlignmentPage depots={depots} />
         )}
 
-        {currentPage === "amt-scheduler-connector" && (
+        {currentPage === "amt-scheduler-connector" && depots.length > 0 && (
           <AmtSchedulerConnectorPage depots={depots} />
         )}
 
@@ -3053,7 +3081,7 @@ function App() {
           </div>
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-[1.4fr_0.7fr_0.8fr_0.8fr_1fr_1fr_auto]">
             <select className="border border-line bg-white px-3 py-2 text-sm" value={pairingFilters.depotId} onChange={(event) => updatePairingFilter("depotId", event.target.value)} title="Depot">
-              <option value="">Select Depot</option>
+
               {depots.map((depot) => (
                 <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>
               ))}
@@ -3404,7 +3432,7 @@ function App() {
           </div>
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-[1.4fr_0.8fr_0.8fr_0.7fr_1fr_auto]">
             <select className="border border-line bg-white px-3 py-2 text-sm" value={departureFilters.depotId} onChange={(event) => updateDepartureFilter("depotId", event.target.value)} title="Depot">
-              <option value="">Select Depot</option>
+
               {depots.map((depot) => (
                 <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>
               ))}
@@ -3987,7 +4015,7 @@ function App() {
             <input className="border border-line px-3 py-2 text-sm" type="date" value={tagFilters.startDate} onChange={(event) => updateTagFilter("startDate", event.target.value)} title="Start date" />
             <input className="border border-line px-3 py-2 text-sm" type="date" value={tagFilters.endDate} onChange={(event) => updateTagFilter("endDate", event.target.value)} title="End date" />
             <select className="border border-line bg-white px-3 py-2 text-sm" value={tagFilters.depotId} onChange={(event) => updateTagFilter("depotId", event.target.value)} title="Depot">
-              <option value="ALL">All Depots</option>
+
               {depots.map((depot) => (
                 <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>
               ))}
@@ -4164,11 +4192,17 @@ function App() {
               <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Main Analysis Table</div>
               <div className="mt-1 text-xs text-slate-500">Showing {tagShowingStart}-{tagShowingEnd} of {tagTotal.toLocaleString()} assignments</div>
             </div>
+            <div className="flex flex-wrap items-center gap-2">
+            <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={handleExportTagAnalysis} disabled={tagLoading || tagExporting || !tagExportParams || tagTotal === 0} title="Export all matching assignments using the applied filters and table sorting">
+              <Download size={16} />
+              {tagExporting ? "Exporting..." : "Export to Excel"}
+            </button>
             <select className="border border-line bg-white px-3 py-2 text-sm" value={tagLimit} onChange={(event) => { setTagOffset(0); setTagLimit(Number(event.target.value)); }} title="Rows per page">
               <option value={25}>25 rows</option>
               <option value={50}>50 rows</option>
               <option value={100}>100 rows</option>
             </select>
+            </div>
           </div>
           <div className="overflow-x-auto border border-line">
             <table className="w-full border-collapse text-sm">
@@ -4241,7 +4275,7 @@ function App() {
           <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Dashboard Filter</div>
           <div className="grid gap-3 md:grid-cols-[1fr_auto]">
             <select className="border border-line bg-white px-3 py-2 text-sm" value={dashboardDepotId} onChange={(event) => setDashboardDepotId(event.target.value)} title="Filter dashboard by depot">
-              <option value="ALL">All Depots</option>
+
               {depots.map((depot) => (
                 <option key={depot.depot_id} value={depot.depot_id}>
                   {depot.depot_name}
@@ -4256,6 +4290,8 @@ function App() {
         </section>
         )}
 
+        {currentPage === "restricted-roads" && <RestrictedRoadsPage depotId={activeDepotId} />}
+        {currentPage === "master-data" && <div className="mb-4"><button className="border border-line bg-white px-4 py-2 text-sm" onClick={() => navigate("restricted-roads")}>Kelola Restricted Roads</button></div>}
         {currentPage === "master-data" && (
         <section className="mb-5 border border-line bg-white p-4">
           <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600">
@@ -4266,12 +4302,12 @@ function App() {
             <select className="border border-line bg-white px-3 py-2 text-sm" value={domain} onChange={(event) => handleDomainChange(event.target.value)} title="Import domain">
               <option value="MOBIL_TANGKI">Mobil Tangki</option>
               <option value="SPBU">SPBU</option>
-              <option value="LOADING_ORDER">Loading Order</option>
+              <option value="LOADING_ORDER">Historikal Shipment</option>
               <option value="GPS">GPS Data</option>
             </select>
             <input className="border border-line px-3 py-2 text-sm" value={sheetName} onChange={(event) => setSheetName(event.target.value)} placeholder="Sheet name" title="Sheet name" />
             <input ref={fileInputRef} className="hidden" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={handleFileSelected} />
-            <button className="inline-flex items-center justify-center gap-2 bg-amber px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => fileInputRef.current?.click()} disabled={uploading || Boolean(activeImportId)} title="Choose XLSX or CSV file to import">
+            <button className="inline-flex items-center justify-center gap-2 bg-amber px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => fileInputRef.current?.click()} disabled={!activeDepotId || uploading || Boolean(activeImportId)} title="Choose XLSX or CSV file to import">
               <FileUp size={16} />
               {uploading ? "Uploading" : activeImportId ? "Import Processing" : "Import File"}
             </button>
@@ -4284,6 +4320,7 @@ function App() {
               Refresh
             </button>
           </div>
+          <p className="mt-3 text-sm text-slate-600">Upload mengikuti depot aktif: <strong>{depots[0]?.depot_name || "Pilih depot di top bar"}</strong>. File tidak perlu kolom depot ID atau nama depot.</p>
           {activeImportId && (
             <div className="mt-3 border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
               Import tetap berjalan di background dan aman jika halaman di-refresh. Status: {activeImportStatus || "QUEUED"}.
@@ -4313,7 +4350,7 @@ function App() {
               <option value="MOBIL_TANGKI">Mobil Tangki</option>
               <option value="SPBU">SPBU</option>
               <option value="SHIPMENT">Shipments</option>
-              <option value="LOADING_ORDER">Loading Orders</option>
+              <option value="LOADING_ORDER">Historikal Shipment</option>
             </select>
             <select className="border border-line bg-white px-3 py-2 text-sm" value={exportDepotId} onChange={(event) => setExportDepotId(event.target.value)} title="Depot">
               {depots.length === 0 && <option value="">No depot data</option>}
@@ -4359,7 +4396,7 @@ function App() {
               <tbody>
                 {imports.map((item) => (
                   <tr key={item.import_id} className="border-b border-line">
-                    <td className="py-2 pr-3">{item.domain}</td>
+                    <td className="py-2 pr-3">{item.domain === "LOADING_ORDER" ? "Historikal Shipment" : item.domain}</td>
                     <td className="py-2 pr-3">{item.filename}</td>
                     <td className="whitespace-nowrap py-2 pr-3">{formatImportDateTime(item.uploaded_at)}</td>
                     <td className="py-2 pr-3">{item.total_rows.toLocaleString()}</td>
@@ -4433,7 +4470,7 @@ function App() {
               disabled={!activeCrudConfig.depotFilter}
               title="Filter depot"
             >
-              <option value="ALL">All Depots</option>
+
               {depots.map((depot) => (
                 <option key={depot.depot_id} value={depot.depot_id}>
                   {depot.depot_name}

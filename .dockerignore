@@ -1,6 +1,8 @@
 .git
 .DS_Store
 .env
+routing-data/
+outputs/
 .venv/
 .venv-*/
 **/__pycache__/

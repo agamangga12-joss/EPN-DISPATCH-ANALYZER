@@ -5,6 +5,8 @@ import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap
 import "leaflet/dist/leaflet.css";
 import { apiFile, apiForm, apiGet, apiSend, downloadFormFromApi, downloadFromApi } from "../lib/api";
 
+import UnassignedShipmentDialog from "./UnassignedShipmentDialog";
+
 type Depot = { depot_id: string; depot_name: string };
 type Product = { product_id: string; product_name: string; active_status?: string };
 type MasterSpbuOption = {
@@ -664,7 +666,7 @@ function GeographicMTRouteMap({ payload, runId }: { payload: GeographicRoutes; r
 }
 
 export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]; products: Product[] }) {
-  const [depotId, setDepotId] = useState("");
+  const [depotId, setDepotId] = useState(depots[0]?.depot_id || "");
   const [models, setModels] = useState<Model[]>([]);
   const [masterSpbus, setMasterSpbus] = useState<MasterSpbuOption[]>([]);
   const [modelId, setModelId] = useState("");
@@ -683,6 +685,8 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
   const [runFeedback, setRunFeedback] = useState<{ status: "RUNNING" | "SUCCESS" | "ERROR"; message: string } | null>(null);
   const [activeRuns, setActiveRuns] = useState<ActivePredictionTask[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [unassignedShipment, setUnassignedShipment] = useState<Shipment | null>(null);
+  useEffect(() => { setUnassignedShipment(null); }, [result?.id]);
   const [candidateLoadingShipment, setCandidateLoadingShipment] = useState<string | null>(null);
   const [shiftTab, setShiftTab] = useState("ALL");
   const [shipmentPage, setShipmentPage] = useState(1);
@@ -718,6 +722,11 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
   const [mtSearch, setMtSearch] = useState("");
   const [mtPage, setMtPage] = useState(1);
   const [mtsPerPage, setMtsPerPage] = useState(25);
+  const [selectedMtIds, setSelectedMtIds] = useState<Set<string>>(new Set());
+  const [mtBulkAction, setMtBulkAction] = useState<"STATUS" | "ETA" | null>(null);
+  const [mtBulkScope, setMtBulkScope] = useState<"SELECTED" | "FILTERED">("FILTERED");
+  const [mtBulkStatus, setMtBulkStatus] = useState<ManagedMtAvailability["status"]>("ACTIVE");
+  const [mtBulkEta, setMtBulkEta] = useState("");
 
   const selectedModel = models.find((model) => model.model_id === modelId) ?? null;
   const activeProducts = useMemo(
@@ -788,6 +797,14 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
     currentMtPage * mtsPerPage,
   );
   const activeManagedMtCount = managedMts.filter((row) => row.status === "ACTIVE").length;
+  const selectedManagedMts = managedMts.filter((row) => selectedMtIds.has(row.id));
+  const mtBulkTargets = mtBulkScope === "SELECTED" ? selectedManagedMts : filteredManagedMts;
+  const allFilteredMtsSelected = filteredManagedMts.length > 0 && filteredManagedMts.every((row) => selectedMtIds.has(row.id));
+
+  useEffect(() => {
+    setSelectedMtIds(new Set());
+    setMtBulkAction(null);
+  }, [depotId, modelId]);
 
   useEffect(() => {
     setLoadingOrderPage(1);
@@ -1219,6 +1236,8 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
         return;
       }
       setMtManagementReady(true);
+      setSelectedMtIds(new Set());
+      setMtBulkAction(null);
       setMtSearch("");
       setMtPage(1);
       const eligibleCount = rows.filter((row) => row.status === "ACTIVE").length;
@@ -1250,6 +1269,28 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
       managedMts,
       `ETA on Depot ${row.vehicle_registration_no} disimpan sebagai waktu MT available di depot.`,
     );
+  }
+
+  function openMtBulkAction(action: "STATUS" | "ETA") {
+    setError(null);
+    setMtBulkScope(selectedManagedMts.length > 0 ? "SELECTED" : "FILTERED");
+    setMtBulkStatus("ACTIVE");
+    setMtBulkEta(defaultMtEta(selectedModel, loValidation));
+    setMtBulkAction(action);
+  }
+
+  async function applyMtBulkAction() {
+    if (!mtBulkAction || mtManagementLoading || mtBulkTargets.length === 0) return;
+    if (mtBulkAction === "ETA" && !mtBulkEta) return;
+    const targetIds = new Set(mtBulkTargets.map((row) => row.id));
+    const rows = managedMts.map((row) => !targetIds.has(row.id) ? row : (
+      mtBulkAction === "STATUS" ? { ...row, status: mtBulkStatus } : { ...row, eta_on_depot: mtBulkEta }
+    ));
+    const count = targetIds.size.toLocaleString("id-ID");
+    const message = mtBulkAction === "STATUS"
+      ? `${count} MT diperbarui menjadi ${mtBulkStatus === "ACTIVE" ? "Active" : "Deactive"}.`
+      : `ETA on Depot untuk ${count} MT diset ke ${mtBulkEta.replace("T", " ")}.`;
+    if (await persistManagedMtAvailability(rows, message)) setMtBulkAction(null);
   }
 
   async function downloadValidation() {
@@ -1598,6 +1639,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
 
   return (
     <div className="space-y-5">
+      {unassignedShipment && result && <UnassignedShipmentDialog key={`${result.id}-${unassignedShipment.id}`} runId={result.id} shipment={unassignedShipment} onClose={() => setUnassignedShipment(null)} />}
       {error && <div className="flex items-start justify-between border border-rust bg-rust/5 px-4 py-3 text-sm text-rust"><span>{error}</span><button onClick={() => setError(null)}><XCircle size={17} /></button></div>}
 
       {demoDialogOpen && (
@@ -1684,7 +1726,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
           <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
             Depot
             <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={depotId} onChange={(event) => setDepotId(event.target.value)}>
-              <option value="">Select Depot</option>
+
               {depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}
             </select>
           </label>
@@ -1859,21 +1901,39 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
               Search MT
               <input className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink placeholder:text-slate-400" placeholder="Cari no MT, tag class, status, atau ETA…" value={mtSearch} onChange={(event) => setMtSearch(event.target.value)} />
             </label>
-            <div className="text-sm text-slate-500"><strong className="text-petroink">{activeManagedMtCount.toLocaleString("id-ID")}</strong> Active · {(managedMts.length - activeManagedMtCount).toLocaleString("id-ID")} Deactive</div>
+            <div className="text-sm text-slate-500"><strong className="text-petroink">{activeManagedMtCount.toLocaleString("id-ID")}</strong> Active · {(managedMts.length - activeManagedMtCount).toLocaleString("id-ID")} Deactive
+              {selectedManagedMts.length > 0 && <span className="ml-3">{selectedManagedMts.length.toLocaleString("id-ID")} MT dipilih <button type="button" className="ml-2 text-petroblue underline disabled:opacity-40" disabled={mtManagementLoading} onClick={() => setSelectedMtIds(new Set())}>Hapus pilihan</button></span>}
+            </div>
           </div>
           <div className="mt-4 overflow-x-auto border border-line">
             <table className="min-w-full text-left text-sm">
               <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                 <tr>
+                  <th className="px-3 py-3"><input type="checkbox" aria-label="Pilih semua MT hasil pencarian, seluruh halaman" title="Pilih semua MT hasil pencarian, seluruh halaman" checked={allFilteredMtsSelected} disabled={mtManagementLoading || filteredManagedMts.length === 0} onChange={(event) => {
+                    const checked = event.target.checked;
+                    setSelectedMtIds((current) => {
+                      const next = new Set(current);
+                      filteredManagedMts.forEach((row) => checked ? next.add(row.id) : next.delete(row.id));
+                      return next;
+                    });
+                  }} /></th>
                   <th className="px-3 py-3 font-semibold">No MT</th>
                   <th className="px-3 py-3 font-semibold">MT Tag Class</th>
-                  <th className="px-3 py-3 font-semibold">Status</th>
-                  <th className="min-w-64 px-3 py-3 font-semibold">ETA on Depot</th>
+                  <th className="px-3 py-3 font-semibold"><div className="flex items-center gap-2"><span>Status</span><button type="button" className="inline-flex items-center gap-1 whitespace-nowrap border border-line bg-white px-2 py-1 text-xs normal-case text-petroblue disabled:opacity-40" disabled={mtManagementLoading || managedMts.length === 0} onClick={() => openMtBulkAction("STATUS")}><Pencil size={12} /> Bulk Action</button></div></th>
+                  <th className="min-w-64 px-3 py-3 font-semibold"><div className="flex items-center gap-2"><span>ETA on Depot</span><button type="button" className="inline-flex items-center gap-1 whitespace-nowrap border border-line bg-white px-2 py-1 text-xs normal-case text-petroblue disabled:opacity-40" disabled={mtManagementLoading || managedMts.length === 0} onClick={() => openMtBulkAction("ETA")}><Pencil size={12} /> Bulk Action</button></div></th>
                 </tr>
               </thead>
               <tbody>
                 {paginatedManagedMts.map((row) => (
                   <tr key={row.id} className="border-t border-line">
+                    <td className="px-3 py-3"><input type="checkbox" aria-label={`Pilih MT ${row.vehicle_registration_no}`} checked={selectedMtIds.has(row.id)} disabled={mtManagementLoading} onChange={(event) => {
+                      const checked = event.target.checked;
+                      setSelectedMtIds((current) => {
+                        const next = new Set(current);
+                        if (checked) next.add(row.id); else next.delete(row.id);
+                        return next;
+                      });
+                    }} /></td>
                     <td className="px-3 py-3 font-medium text-petroink">{row.vehicle_registration_no}</td>
                     <td className="px-3 py-3 text-petroink">
                       <div>{row.mt_tag_class}</div>
@@ -1905,7 +1965,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
                   </tr>
                 ))}
                 {paginatedManagedMts.length === 0 && (
-                  <tr><td colSpan={4} className="px-4 py-10 text-center text-sm text-slate-500">Tidak ada MT yang cocok dengan pencarian saat ini.</td></tr>
+                  <tr><td colSpan={5} className="px-4 py-10 text-center text-sm text-slate-500">Tidak ada MT yang cocok dengan pencarian saat ini.</td></tr>
                 )}
               </tbody>
             </table>
@@ -1926,6 +1986,37 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
             </div>
           </div>
         </section>
+      )}
+
+      {mtBulkAction && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="mt-bulk-action-title">
+          <form className="w-full max-w-lg border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void applyMtBulkAction(); }}>
+            <h2 id="mt-bulk-action-title" className="text-lg font-semibold text-petroink">{mtBulkAction === "STATUS" ? "Bulk Status MT" : "Bulk ETA on Depot"}</h2>
+            {error && <div className="mt-3 border border-rust bg-rust/5 p-3 text-sm text-rust" role="alert">{error}</div>}
+            <label className="mt-4 grid gap-1 text-sm text-slate-600">Terapkan pada
+              <select className="border border-line px-3 py-2 text-petroink" value={mtBulkScope} disabled={mtManagementLoading} onChange={(event) => setMtBulkScope(event.target.value as "SELECTED" | "FILTERED")}>
+                <option value="SELECTED" disabled={selectedManagedMts.length === 0}>MT yang dipilih ({selectedManagedMts.length.toLocaleString("id-ID")})</option>
+                <option value="FILTERED">Semua hasil pencarian ({filteredManagedMts.length.toLocaleString("id-ID")}) — seluruh halaman</option>
+              </select>
+            </label>
+            {mtBulkAction === "STATUS" ? (
+              <label className="mt-4 grid gap-1 text-sm text-slate-600">Status
+                <select className="border border-line px-3 py-2 text-petroink" value={mtBulkStatus} disabled={mtManagementLoading} onChange={(event) => setMtBulkStatus(event.target.value as ManagedMtAvailability["status"])}>
+                  <option value="ACTIVE">Active</option><option value="DEACTIVE">Deactive</option>
+                </select>
+              </label>
+            ) : (
+              <label className="mt-4 grid gap-1 text-sm text-slate-600">ETA on Depot
+                <input className="border border-line px-3 py-2 text-petroink" type="datetime-local" required value={mtBulkEta} disabled={mtManagementLoading} onChange={(event) => setMtBulkEta(event.target.value)} />
+              </label>
+            )}
+            <p className="mt-4 text-sm text-slate-500">{mtBulkTargets.length.toLocaleString("id-ID")} MT akan diperbarui dan input prediction akan divalidasi ulang.</p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" className="border border-line px-3 py-2 text-sm disabled:opacity-40" disabled={mtManagementLoading} onClick={() => setMtBulkAction(null)}>Batal</button>
+              <button type="submit" className="bg-mint px-3 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={mtManagementLoading || mtBulkTargets.length === 0 || (mtBulkAction === "ETA" && !mtBulkEta)}>{mtManagementLoading ? "Menyimpan…" : "Terapkan"}</button>
+            </div>
+          </form>
+        </div>
       )}
 
       {(loValidation || mtValidation) && (
@@ -2023,7 +2114,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
                   <Fragment key={shipment.id}>
                     <tr className="border-t border-line align-top">
                       <td className="px-3 py-3"><button aria-label={`${expanded === shipment.id ? "Tutup" : "Buka"} detail ${shipment.predicted_shipment_id}`} onClick={() => void toggleShipmentDetail(shipment)}>{expanded === shipment.id ? <ChevronDown size={17} /> : <ChevronRight size={17} />}</button></td>
-                      <td className="px-3 py-3 font-mono text-xs">{shipment.trip?.trip_id ?? "—"}<div className="mt-1 text-slate-400">#{shipment.trip?.trip_number ?? "—"}</div></td><td className="px-3 py-3">{shipment.assignment.assigned_vehicle_registration ?? "—"}{shipment.assignment.assigned_vehicle_capacity_kl !== null && <div className="mt-1 text-xs text-slate-400">{shipment.assignment.assigned_vehicle_capacity_kl} KL · {shipment.assignment.assigned_vehicle_compartments} compartment</div>}</td><td className="px-3 py-3"><div className="font-mono text-xs">{shipment.predicted_shipment_id}</div><div className="mt-1">{shipment.lines.map((line) => line.spbu_no).join(" → ")}</div><div className="mt-1 text-xs text-slate-400">{shipment.lines.length} LO · {shipment.total_order_kl} KL · {shipment.required_compartments} compartment</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.planned_start_datetime)}<div className="mt-1 text-xs text-slate-400">{shipment.shift}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.predicted_departure_datetime)}{Boolean(shipment.trip?.delay_minutes) && <div className="mt-1 text-xs text-amber">+{shipment.trip?.delay_minutes} min</div>}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.estimated_return_datetime)}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.next_available_datetime)}</td><td className="px-3 py-3"><div>{pct(shipment.shipment_prediction_score)} / {pct(shipment.assignment.mt_assignment_score)}</div>{shipment.trip?.routing_confidence && <Badge value={shipment.trip.routing_confidence} />}</td><td className="px-3 py-3"><Badge value={shipment.assignment.assignment_status} />{shipment.trip?.fallback_used && <div className="mt-1"><Badge value="ROUTE_FALLBACK" /></div>}{shipment.assignment.unassigned_reason && <div className="mt-1 text-xs text-rust">{shipment.assignment.unassigned_reason.replace(/_/g, " ")}</div>}</td>
+                      <td className="px-3 py-3 font-mono text-xs">{shipment.trip?.trip_id ?? "—"}<div className="mt-1 text-slate-400">#{shipment.trip?.trip_number ?? "—"}</div></td><td className="px-3 py-3">{shipment.assignment.assigned_vehicle_registration ?? "—"}{shipment.assignment.assigned_vehicle_capacity_kl !== null && <div className="mt-1 text-xs text-slate-400">{shipment.assignment.assigned_vehicle_capacity_kl} KL · {shipment.assignment.assigned_vehicle_compartments} compartment</div>}</td><td className="px-3 py-3"><div className="font-mono text-xs">{shipment.predicted_shipment_id}</div><div className="mt-1">{shipment.lines.map((line) => line.spbu_no).join(" → ")}</div><div className="mt-1 text-xs text-slate-400">{shipment.lines.length} LO · {shipment.total_order_kl} KL · {shipment.required_compartments} compartment</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.planned_start_datetime)}<div className="mt-1 text-xs text-slate-400">{shipment.shift}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.predicted_departure_datetime)}{Boolean(shipment.trip?.delay_minutes) && <div className="mt-1 text-xs text-amber">+{shipment.trip?.delay_minutes} min</div>}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.estimated_return_datetime)}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.next_available_datetime)}</td><td className="px-3 py-3"><div>{pct(shipment.shipment_prediction_score)} / {pct(shipment.assignment.mt_assignment_score)}</div>{shipment.trip?.routing_confidence && <Badge value={shipment.trip.routing_confidence} />}</td><td className="px-3 py-3">{shipment.assignment.assignment_status === "UNASSIGNED" ? <button type="button" aria-haspopup="dialog" title="Klik untuk melihat alasan unassigned" className="rounded focus:ring-2 focus:ring-petroblue" onClick={() => setUnassignedShipment(shipment)}><Badge value={shipment.assignment.assignment_status} /><span className="mt-1 block text-xs text-petroblue underline">Lihat alasan</span></button> : <Badge value={shipment.assignment.assignment_status} />}{shipment.trip?.fallback_used && <div className="mt-1"><Badge value="ROUTE_FALLBACK" /></div>}{shipment.assignment.unassigned_reason && <div className="mt-1 text-xs text-rust">{shipment.assignment.unassigned_reason.replace(/_/g, " ")}</div>}</td>
                     </tr>
                     {expanded === shipment.id && (
                       <tr key={`${shipment.id}-detail`} className="border-t border-line bg-slate-50/60"><td colSpan={10} className="p-4">

@@ -24,6 +24,7 @@ from .models import (
     MasterDepot,
     MasterMT,
     MasterSPBU,
+    MasterTag,
 )
 from .phase6_capacity import capacity_compatible, shipment_capacity
 
@@ -534,6 +535,9 @@ def predict_mt_candidates(
         for spbu_id, tag_id in db.execute(select(BridgeSPBUTag.spbu_id, BridgeSPBUTag.tag_id).where(BridgeSPBUTag.spbu_id.in_(spbu_ids))).all():
             spbu_tags[spbu_id].add(tag_id)
 
+    tag_ids = set().union(*mt_tags.values(), *spbu_tags.values())
+    tag_labels = {row.tag_id: row.tag_value for row in db.scalars(select(MasterTag).where(MasterTag.tag_id.in_(tag_ids))).all()} if tag_ids else {}
+
     affinity_rows = db.scalars(
         select(FactSPBUMTPair).where(
             FactSPBUMTPair.depot_id == depot_id,
@@ -564,6 +568,7 @@ def predict_mt_candidates(
                     mt_tag_ids=mt_tags.get(vehicle_id, set()),
                     spbu_tag_ids=spbu_tags.get(line["spbu_id"], set()),
                     vehicle_mode=vehicle_compatibility_mode,
+                    tag_labels=tag_labels,
                 )
                 for line in shipment["lines"]
             ]
@@ -602,6 +607,10 @@ def predict_mt_candidates(
                         "historical_evidence_confidence": round(sum(evidence_confidence) / len(evidence_confidence), 6),
                         "score_method": "mean Laplace-smoothed Phase 4 P(MT|SPBU)",
                         "master_compatibility": "PASS" if master_compatible else "FAIL",
+                        "master_checks": [
+                            {"spbu_id": line["spbu_id"], "spbu_code": spbus[line["spbu_id"]].spbu_code, **check}
+                            for line, check in zip(shipment["lines"], checks)
+                        ],
                         "capacity_compatibility": "PASS" if capacity_check["compatible"] else "FAIL",
                         "capacity_policy": capacity_check["utilization_policy"],
                         "shipment_total_kl": capacity_check["shipment"]["total_order_kl"],

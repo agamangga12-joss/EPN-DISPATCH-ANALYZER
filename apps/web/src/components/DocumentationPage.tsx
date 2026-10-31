@@ -91,7 +91,7 @@ const guides: GuidePage[] = [
         id: "doc-dashboard-pakai",
         title: "Fungsi dan cara menggunakan",
         paragraphs: [
-          "Pilih All Depots untuk gambaran lintas depot atau satu depot untuk audit lokal, lalu tekan Apply Filter. Gunakan halaman ini sebagai health check sebelum membuka fase analitik.",
+          "Pilih depot aktif di top bar sebelah kiri Google Maps Settings. Dashboard dan halaman analisis mengikuti depot tersebut. Gunakan halaman ini sebagai health check sebelum membuka fase analitik.",
         ],
       },
       {
@@ -136,12 +136,24 @@ const guides: GuidePage[] = [
         id: "doc-master-pakai",
         title: "Cara import, export, dan CRUD",
         steps: [
-          { title: "Pilih domain", text: "Mobil Tangki, SPBU, Loading Order, atau GPS." },
+          { title: "Pilih depot aktif", text: "Gunakan pilihan depot di top bar. Depot tersimpan saat upload dimulai dan tidak perlu ditulis lagi di file MT, SPBU, atau Historikal Shipment." },
+          { title: "Pilih domain", text: "Mobil Tangki, SPBU, Historikal Shipment, atau GPS." },
           { title: "Gunakan template", text: "Download template agar nama dan tipe kolom sesuai validator." },
           { title: "Import file", text: "Pilih sheet dan upload XLSX/CSV. Sistem melakukan staging, validation, normalization, lalu publish." },
           { title: "Audit history", text: "Periksa total, valid, warning, rejected, dan status batch." },
           { title: "Perbaiki melalui CRUD", text: "Cari, filter, sort, pilih row, lalu Add, Edit, atau Delete." },
         ],
+      },
+      {
+        id: "doc-master-struktur",
+        title: "Struktur master dan waktu historikal",
+        paragraphs: [
+          "MT menggunakan Vehicle Registration serta Tag Vehicle Class dalam KL sebagai sumber kapasitas. SPBU menggunakan SPBU Code, Address, Latitude, dan Longitude. Unduh template terbaru untuk nama kolom yang tepat.",
+          "Historikal Shipment menggunakan Actual KM serta satu timestamp untuk masing-masing Validation, Gate Out, dan Shipment End. Tanggal operasional diturunkan dari Validation pada zona waktu depot; status, area, shipto, dan kolom tanggal/jam terpisah tidak perlu diisi.",
+          "Waktu master SPBU dihitung ulang setelah import, edit, atau hapus historikal. Sampel hanya shipment dengan satu SPBU terpetakan dan durasi positif. Beberapa baris produk dari shipment yang sama dihitung satu sampel. Shipment multi-SPBU tidak digunakan karena durasi per tujuan tidak diketahui.",
+        ],
+        formulas: ["RTH per shipment (menit) = Shipment End - Gate Out\nMaster RTH = median RTH shipment satu SPBU\nMaster Travel Time (estimasi satu arah) = Master RTH / 2"],
+        note: "RTH mencakup layanan dan waktu tunggu di luar depot. Estimasi satu arah bukan pengukuran waktu mengemudi murni. Tanpa histori valid, waktu dibiarkan kosong dan jumlah sampel 0. Model dan route tersimpan adalah snapshot; jalankan ulang analisis atau buat run baru untuk memakai master terbaru.",
       },
       {
         id: "doc-master-card",
@@ -180,6 +192,7 @@ const guides: GuidePage[] = [
         title: "Fungsi dan cara menggunakan",
         paragraphs: [
           "Pilih tanggal, depot, SPBU, kendaraan, tag type, status, product, vehicle class, atau search. Klik row evidence untuk membuka Loading Order Tag Analysis dan melihat rule per tag.",
+          "Pada Main Analysis Table, klik Export to Excel untuk mengunduh seluruh hasil sesuai filter yang sudah diterapkan dan urutan tabel. Export mencakup semua halaman serta teks Issue / Reason lengkap. Perubahan filter yang belum diterapkan tidak mengubah cakupan export.",
         ],
       },
       {
@@ -455,10 +468,10 @@ const guides: GuidePage[] = [
           { name: "3. LO Upload", meaning: "LO, tanggal/jam, SPBU, Product, quantity tepat 8 KL.", reading: "Data Demo meminta tanggal LO, membagi total KL ÷ 8, membentuk jam dari shift model, dan hanya memilih SPBU dengan history_eligible=true." },
           { name: "3A. LO Management", meaning: "Editor row LO dan Product sebelum prediction.", reading: "Add/Edit memakai dropdown Master SPBU depot dan Master Product aktif, bukan free text. Perubahan membentuk ulang workbook aktif dan validasi backend; gunakan filter Product/per kolom, sort header, dan pagination untuk review." },
           { name: "4. MT Availability", meaning: "Import MT canonical aktif dari depot terpilih.", reading: "Tidak ada upload Excel, template, atau Data Demo; Import Data from Master Data membuka MT Management." },
-          { name: "4A. MT Management", meaning: "No MT, MT Tag Class, status operasional, dan ETA on Depot.", reading: "Tidak ada Add/Delete. MT eligible default Active dan MT dengan profil kapasitas tidak valid default Deactive; semua ETA memakai awal Shift 1. Deactive mengecualikan MT dari prediction tanpa mengubah Master MT." },
+          { name: "4A. MT Management", meaning: "No MT, MT Tag Class, status operasional, dan ETA on Depot.", reading: "MT eligible default Active dan MT dengan profil kapasitas tidak valid default Deactive; semua ETA memakai awal Shift 1. Gunakan checkbox untuk memilih MT lintas halaman. Tombol Bulk Action di samping header Status dan ETA on Depot menerapkan perubahan pada MT terpilih atau seluruh hasil pencarian, lalu memvalidasi ulang input prediction. Checkbox header memilih seluruh hasil pencarian. Deactive mengecualikan MT dari prediction tanpa mengubah Master MT." },
           { name: "5. Validation", meaning: "Severity, code, row, message.", reading: "Selesaikan ERROR sebelum Run." },
           { name: "6. Summary", meaning: "LO, KL, SPBU, shipment, MT, assigned, delay, unassigned, multi-trip, fallback, confidence.", reading: "Tabel shift dan cache metrics melengkapi total." },
-          { name: "7–8. Shipment & Assignment", meaning: "Grouping, MT, compartment, timeline, score, status.", reading: "Expand untuk melihat SPBU + cluster, explanation, route, candidate, exclusion, dan override. Move to menampilkan shipment, SPBU, serta cluster target." },
+          { name: "7–8. Shipment & Assignment", meaning: "Grouping, MT, compartment, timeline, score, status.", reading: "Klik status Unassigned untuk melihat alasan run, aturan gagal per MT, kapasitas, dan tag yang kurang per SPBU. Run baru menyimpan rincian master saat run; run lama menampilkan pemeriksaan master saat ini dengan label terpisah. Expand untuk melihat SPBU + cluster, explanation, route, candidate, exclusion, dan override. Move to menampilkan shipment, SPBU, serta cluster target." },
           { name: "MT Multi-Trip Timeline", meaning: "Bar departure sampai turnaround.", reading: "Bar satu MT tidak boleh overlap." },
           { name: "9A. Prediction Network", meaning: "Edge predicted same shipment.", reading: "Bukan route map." },
           { name: "9B. Assignment Matrix", meaning: "Affinity score, compatibility, selected MT.", reading: "X incompatible; outline assigned." },
@@ -514,7 +527,7 @@ const guides: GuidePage[] = [
           { name: "Job Management", meaning: "Create, search, sort per header, pagination, Open Job, Delete Job, dan live status background optimization setelah depot dipilih.", reading: "Row CALCULATING memakai spinner dan polling dua detik; Job tetap dapat dibuka tetapi tidak dapat dihapus atau di-submit ulang. Delete mempertahankan source Phase 6, master data, dan detached provider audit." },
           { name: "Job Overview", meaning: "Source run serta Optimization Flow untuk Validate, Initial, dan Re-optimize.", reading: "Validate berada tepat sebelum Run Initial Optimization dan membuka popup Optimization Readiness. Dialog optimize menghitung saran Route Time Limit dari jumlah LO/MT; nilai di bawah saran wajib dikonfirmasi. Source Phase 6 dikunci setelah load; setiap optimize wajib memiliki reference time dalam timezone depot." },
           { name: "LO Management", meaning: "Search, sort per header, pagination, selection, Phase 6/current assignment, System ETA Depot per trip, dan status.", reading: "System ETA setiap LO mengikuti estimated return trip tempat LO ditugaskan; Trip 1 dan Trip 2 dapat memiliki ETA berbeda. Select-all hanya memilih LO pada halaman aktif. PLANNED dapat dioptimalkan; ONGOING/DONE serta freeze-window ditahan." },
-          { name: "MT Management", meaning: "Search, sort per header, pagination, capacity/compartment, Planned/System/Effective ETA, Delivery Status, operational status, dan working time.", reading: "Delivery Status dihitung langsung dari LO assignment: ONGOING didahulukan, lalu DONE, selain itu PLANNED. Planned ETA wajib untuk semua MT, menjadi satu-satunya availability input, dan di-reset setelah sukses. System ETA hanya tampil untuk MT ONGOING dan sama dengan return ETA trip tempat LO ongoing berada; status lain menampilkan null." },
+          { name: "MT Management", meaning: "Search, sort per header, pagination, capacity/compartment, Planned/System/Effective ETA, Delivery Status, operational status, dan working time.", reading: "Gunakan checkbox lintas halaman dan Bulk Action di samping header Operational Status atau Planned ETA Depot untuk mengubah MT terpilih atau seluruh hasil pencarian. Active memakai READY; Deactive memakai UNAVAILABLE. Template MT Readiness (.xlsx) otomatis memuat registrasi seluruh MT Job lintas halaman serta status dan ETA tersimpan. Import Excel MT Readiness memperbarui Operational Status dan Planned ETA Depot berdasarkan registrasi; tanggal tanpa offset dibaca dalam timezone depot. Kolom kosong tidak mengubah nilai. Registrasi asing/duplikat, formula, status tidak valid, atau tanggal salah membatalkan seluruh upload dengan nomor baris. Import langsung tersimpan tanpa Apply MT Update. Delivery Status dihitung dari LO assignment: ONGOING didahulukan, lalu DONE, selain itu PLANNED. Planned ETA wajib, menjadi input availability, dan di-reset setelah optimasi sukses. System ETA hanya tampil untuk MT ONGOING dan mengikuti return ETA trip terkait." },
           { name: "Bay Management", meaning: "Add/Delete Bay, allowed product, jam operasi, arms/mode, durasi per product/compartment, occupancy, dan queue.", reading: "Delete Bay mengeluarkan bay dari konfigurasi aktif tetapi mempertahankan histori route/bay assignment. Compatibility product dan queue aktual adalah constraint." },
           { name: "Parameter", meaning: "Objective, solver, biaya, registry constraint HARD/SOFT/disabled, Bay Scheduler Strategy, MT Turnaround Buffer, time limit, CP-SAT workers, penalty, serta Vehicle Activation Cost Rules.", reading: "FIFO_BALANCED adalah default operational bay scheduler. Bay Time Limit/Workers hanya berlaku pada strategi CP_SAT opt-in. MT Turnaround Buffer tersimpan per profile dan menunda eligibility trip berikutnya setelah MT kembali. MT Working Time menyimpan limit menit langsung pada rule. Priority activation memilih rule biaya yang menang; activation cost memengaruhi objective, bukan compatibility. Save membuat profile version dan setiap run menyalin effective snapshot + checksum." },
           { name: "Route Plan", meaning: "Search nomor/ID MT, filter, dan pagination per MT; dilanjutkan card Vehicle Multi-Trip Timeline dan Route Details.", reading: "Search MT mencocokkan registration maupun canonical mt_id dan langsung menyaring scope Gantt serta Route Details dengan pagination kembali ke halaman pertama. Card Vehicle Multi-Trip Timeline tampil terpisah tepat setelah Route Plan dan sebelum tabel detail. Gantt hanya merender MT pada halaman aktif, dengan jam dari first gate-out sampai final return dan registration MT di sisi kanan. Bar menunjukkan queue/loading/gate/travel/service; hover milestone menjelaskan perjalanan, tiba di SPBU, dan kembali ke depot. Dropdown All MT/satu nomor MT memakai scope yang sama. Kolom Product menampilkan nama canonical seperti Bio Solar atau Pertamax." },

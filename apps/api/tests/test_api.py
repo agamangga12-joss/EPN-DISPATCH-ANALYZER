@@ -173,10 +173,11 @@ def test_dashboard_counts_match_database() -> None:
 
     template = client.get("/api/v1/exports/template?domain=MOBIL_TANGKI&file_format=csv")
     assert template.status_code == 200
-    assert template.text.lstrip("\ufeff").startswith("depot_id,")
+    assert template.text.lstrip("\ufeff").startswith("vehicle_registration,")
+    assert "depot_id" not in template.text
     assert "vehicle_type_tag" in template.text
     assert "vehicle_registration" in template.text
-    assert "vehicle_name_raw" in template.text
+    assert "vehicle_name_raw" not in template.text
     assert "source_mt_id" not in template.text
     assert "source_hub_id" not in template.text
     assert "assignee" not in template.text
@@ -191,10 +192,10 @@ def test_dashboard_counts_match_database() -> None:
     exported = client.get(f"/api/v1/exports/data?domain=SPBU&depot_id={depot.depot_id}&file_format=csv")
     assert exported.status_code == 200
     assert "spbu_code" in exported.text
-    assert depot.depot_name in exported.text
+    assert "depot_id" not in exported.text.splitlines()[0]
     with (EXAMPLE_DIR / "template_spbu.xlsx").open("rb") as handle:
         upload_template_spbu = client.post(
-            "/api/v1/imports?domain=SPBU&sheet_name=Lembaga%20Penyalur",
+            f"/api/v1/imports?domain=SPBU&sheet_name=Lembaga%20Penyalur&depot_id={depot.depot_id}",
             files={"file": ("template_spbu.xlsx", handle, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         )
     assert upload_template_spbu.status_code == 202
@@ -205,7 +206,7 @@ def test_dashboard_counts_match_database() -> None:
     assert uploaded_audit["status"] == "QUEUED"
     with (EXAMPLE_DIR / "template_spbu.xlsx").open("rb") as handle:
         wrong_domain_upload = client.post(
-            "/api/v1/imports?domain=MOBIL_TANGKI&sheet_name=SPBU",
+            f"/api/v1/imports?domain=MOBIL_TANGKI&sheet_name=SPBU&depot_id={depot.depot_id}",
             files={"file": ("template_spbu.xlsx", handle, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         )
     assert wrong_domain_upload.status_code == 202
@@ -424,7 +425,7 @@ def test_dashboard_counts_match_database() -> None:
     assert spbu_sort_desc.status_code == 200
     spbu_codes = [row["spbu_code"] for row in spbu_sort_desc.json()["rows"]]
     assert spbu_codes == sorted(spbu_codes, reverse=True)
-    for sort_column in ("primary_depot_id", "source_coordinate"):
+    for sort_column in ("address", "master_distance_km", "master_rth_min", "master_travel_time_min", "master_travel_time_sample_count"):
         spbu_visible_column_sort = client.get(
             f"/api/v1/master-crud/SPBU?limit=10&offset=0&sort_column={sort_column}&sort_direction=asc"
         )
@@ -434,7 +435,10 @@ def test_dashboard_counts_match_database() -> None:
     assert spbu_tag_sort.status_code == 200
     spbu_project_tags = [row["tag_project"] for row in spbu_tag_sort.json()["rows"] if row.get("tag_project")]
     assert spbu_project_tags == sorted(spbu_project_tags)
-    sample_city = quote(sample_spbu.city)
+    address_update = client.put(f"/api/v1/master-crud/SPBU/{sample_spbu.spbu_id}", json={"address": "Alamat pengujian pencarian CRUD"})
+    assert address_update.status_code == 200
+    assert address_update.json()["record"]["city"] == "Alamat pengujian pencarian CRUD"
+    sample_city = quote("Alamat pengujian pencarian CRUD")
     column_scoped_search = client.get(f"/api/v1/master-crud/SPBU?limit=10&offset=0&depot_id={depot.depot_id}&search={sample_city}&search_column=city")
     assert column_scoped_search.status_code == 200
     assert column_scoped_search.json()["total"] > 0

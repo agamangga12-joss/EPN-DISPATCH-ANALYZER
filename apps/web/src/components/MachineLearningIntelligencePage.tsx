@@ -1024,7 +1024,7 @@ export function MachineLearningIntelligencePage({
   depots: Depot[];
 }) {
   const [tab, setTab] = useState<Tab>("concentration");
-  const [depotId, setDepotId] = useState("");
+  const [depotId, setDepotId] = useState(depots[0]?.depot_id || "");
   const [readiness, setReadiness] = useState<Readiness | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2127,7 +2127,7 @@ export function MachineLearningIntelligencePage({
               onChange={(event) => setDepotId(event.target.value)}
               title="Phase 5 depot"
             >
-              <option value="">Select Depot</option>
+
               {depots.map((depot) => (
                 <option key={depot.depot_id} value={depot.depot_id}>
                   {depot.depot_name}

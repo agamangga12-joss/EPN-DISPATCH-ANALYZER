@@ -15,7 +15,11 @@ from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session, defer
 
 from .google_routes import GoogleRoutesError, configuration_snapshot, get_google_routes_configuration
+from .compatibility import evaluate_compatibility_entities
 from .models import (
+    BridgeMTTag,
+    BridgeSPBUTag,
+    MasterTag,
     MLBehavioralModel,
     MLSPBUClusterAssignment,
     MasterDepot,
@@ -1358,9 +1362,36 @@ def get_prediction_shipment_candidates(db: Session, run_id: str, shipment_id: st
         row.mt_id: row
         for row in db.scalars(select(MasterMT).where(MasterMT.mt_id.in_(mt_ids))).all()
     } if mt_ids else {}
+    # Older runs did not save per-SPBU rule evidence. Keep their saved verdict
+    # intact and attach a separately labelled evaluation of today's master data.
+    spbu_ids = set(db.scalars(select(PredictionShipmentLine.spbu_id).where(PredictionShipmentLine.prediction_shipment_id == shipment.id)).all())
+    spbus = {row.spbu_id: row for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()} if spbu_ids else {}
+    mt_tags: dict[str, set[str]] = defaultdict(set)
+    spbu_tags: dict[str, set[str]] = defaultdict(set)
+    for entity_id, tag_id in db.execute(select(BridgeMTTag.mt_id, BridgeMTTag.tag_id).where(BridgeMTTag.mt_id.in_(mt_ids))).all() if mt_ids else []:
+        mt_tags[entity_id].add(tag_id)
+    for entity_id, tag_id in db.execute(select(BridgeSPBUTag.spbu_id, BridgeSPBUTag.tag_id).where(BridgeSPBUTag.spbu_id.in_(spbu_ids))).all() if spbu_ids else []:
+        spbu_tags[entity_id].add(tag_id)
+    tag_ids = set().union(*mt_tags.values(), *spbu_tags.values())
+    tag_labels = {row.tag_id: row.tag_value for row in db.scalars(select(MasterTag).where(MasterTag.tag_id.in_(tag_ids))).all()} if tag_ids else {}
     payload = []
     for candidate in candidates:
         profile = mt_compartment_profile(mts[candidate.vehicle_id]) if candidate.vehicle_id in mts else None
+        explanation = dict(candidate.explanation or {})
+        if "master_checks" not in explanation:
+            explanation["current_master_checks"] = [
+                {
+                    "spbu_id": spbu_id,
+                    "spbu_code": spbus[spbu_id].spbu_code if spbu_id in spbus else spbu_id,
+                    **evaluate_compatibility_entities(
+                        mts.get(candidate.vehicle_id), spbus.get(spbu_id),
+                        mt_tag_ids=mt_tags[candidate.vehicle_id], spbu_tag_ids=spbu_tags[spbu_id],
+                        tag_labels=tag_labels,
+                        vehicle_mode=(run.parameter_snapshot or {}).get("vehicle_compatibility_mode", PHASE6_VEHICLE_COMPATIBILITY_MODE),
+                    ),
+                }
+                for spbu_id in sorted(spbu_ids)
+            ]
         payload.append(
             {
                 "id": candidate.id,
@@ -1372,7 +1403,7 @@ def get_prediction_shipment_candidates(db: Session, run_id: str, shipment_id: st
                 "compatibility_status": candidate.compatibility_status,
                 "candidate_rank": candidate.candidate_rank,
                 "exclusion_reason": candidate.exclusion_reason,
-                "explanation": candidate.explanation,
+                "explanation": explanation,
                 "capacity_kl": profile["capacity_kl"] if profile else None,
                 "number_of_compartments": profile["effective_compartments"] if profile else None,
             }

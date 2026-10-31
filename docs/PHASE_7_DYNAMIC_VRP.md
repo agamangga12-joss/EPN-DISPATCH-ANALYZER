@@ -2,6 +2,11 @@
 
 ## Purpose and boundary
 
+Depot-scoped operator-confirmed road restrictions are documented in
+[RESTRICTED_ROADS.md](RESTRICTED_ROADS.md). When applicable, Google Routes paths are checked against confirmed restricted
+roads and recomputed through operator detour waypoints. The verified matrix and
+exact selected paths are persisted; unrestricted fallback is not allowed.
+
 Phase 7 turns a saved Phase 6 Prediction Run into a versioned daily operational plan. Phase 6 remains the immutable source of predicted shipment/MT/pairing/confidence. Phase 7 stores current vehicle, shipment, trip, stop sequence, compartment, bay, and gate-out assignment in separate tables.
 
 Phase 7 uses:
@@ -398,3 +403,65 @@ Creating a Manual Dispatch Job copies vehicle, trip, LO scope/assignment, route 
 - selecting a newer Phase 7 route requires a new Phase 8 job/version rather than silently replacing an existing snapshot.
 
 Phase 7 remains responsible for fleet-wide assignment, global stop sequencing, multi-trip constraints, compartment placement, and depot bay scheduling. Phase 8 does not call the Phase 7 solver; it applies canonical compatibility guardrails and recalculates only an explicitly edited trip with Google Routes.
+
+
+## Penyesuaian operasional MT dan LO per Job
+
+- **MT Management → Atur Tag**: tag awal mengikuti tag master MT. Hilangkan centang untuk menonaktifkan tag tertentu hanya pada Job ini, atau pilih **Ikuti Semua Tag Master** untuk mengaktifkan seluruh tag kembali. Pengaturan memakai ID tag canonical; master MT dan Job lain tidak berubah. Tag efektif digunakan oleh validasi kecocokan MT–SPBU, solver, biaya aktivasi berbasis tag, dan snapshot operasional.
+- **LO Management → Tambah LO**: setelah source Phase 6 dimuat, masukkan nomor LO unik, SPBU aktif dari depot Job, produk aktif, dan volume KL positif. Tanggal dan depot mengikuti Job. LO tambahan berstatus PLANNED tanpa prediksi assignment Phase 6; sumber Phase 6 tetap utuh.
+- **LO Management → Hapus LO**: pilih satu atau beberapa LO lalu konfirmasi. Penghapusan berupa pembatalan (`user_cancelled`), sehingga data dan versi rute sebelumnya tetap tersimpan. Nomor LO yang dibatalkan tidak dapat dipakai ulang dalam Job yang sama. LO tersebut dikeluarkan dari daftar aktif, KPI volume/LO, validasi, matriks, dan solver berikutnya.
+- LO ONGOING, DONE, frozen, atau bagian dari trip yang sudah berjalan/selesai tidak dapat dibatalkan. Pembatalan beberapa LO bersifat atomik: bila ada LO yang dilindungi, seluruh permintaan ditolak.
+- Perubahan tag dan LO ditolak saat Job CALCULATING. Setelah perubahan, jalankan **Optimization** (belum ada rute) atau **Re-Optimize Now** untuk membuat versi rute baru. Rute yang sudah tersimpan tidak berubah otomatis.
+- Migrasi `0034_phase7_mt_tag_overrides` menambahkan daftar pengecualian tag kosong pada MT operasional yang sudah ada, sehingga perilaku default tetap mengikuti master.
+
+
+## Kecepatan, refueling, dan break per trip
+
+Parameter profile menyediakan:
+
+| Parameter | Default | Perilaku |
+|---|---:|---|
+| `travel_time_mode` | `AUTO` | Durasi dari matriks sistem/Google; `MANUAL_SPEED` menghitung durasi dari jarak rute dan kecepatan operator. |
+| `average_speed_kmh` | 35 | Kecepatan manual 1–150 km/jam; durasi setiap leg dibulatkan ke atas dalam detik. |
+| `refueling_minutes` | 40 | Pengisian BBM setiap setelah gate-out, sebelum mengemudi ke tujuan pertama. |
+| `driving_break_interval_minutes` | 240 | Batas akumulasi mengemudi dalam satu trip, termasuk perjalanan pulang. |
+| `driving_break_minutes` | 30 | Durasi istirahat sebelum melanjutkan mengemudi setelah mencapai batas. |
+| `mt_turnaround_buffer_minutes` | 30 | Waktu tunggu parkir setelah kembali depot sebelum trip berikutnya, terpisah dari refueling dan break. |
+
+Break hanya menghitung detik mengemudi. Pelayanan SPBU, loading, antre, refueling, dan menunggu receiving window tidak menambah atau menghapus akumulasi mengemudi. Akumulasi direset di awal setiap trip; tidak dibawa antar-trip. Jika batas tercapai tepat saat tiba di SPBU, break ditempatkan sebelum mengemudi selanjutnya (setelah pelayanan). Tidak ada break tambahan sesudah tiba di depot terakhir. Nilai refueling/break 0 menonaktifkan durasi masing-masing.
+
+Rumus durasi manual: `ceil(distance_meters × 3.6 / average_speed_kmh)`. Jarak dan pemeriksaan restricted road tetap berasal dari rute yang sama; mode manual tidak mengubah jalan yang boleh dilalui, tidak menghapus pasangan unreachable, dan tidak menimpa cache estimasi Google. Google tetap diperlukan untuk mencari detour ketika restricted road aktif.
+
+Refueling dan break diterapkan saat pemilihan rute, pemeriksaan receiving window, dan batas waktu kerja; bukan sekadar tambahan tampilan. ETA, return depot, biaya operasional, dan kesiapan trip berikutnya menggunakan durasi tambahan. Jadwal bay menggeser gate-out serta seluruh aktivitas sesudahnya. Gantt menampilkan refueling, driving, pelayanan, dan break secara terpisah.
+
+Offset aktivitas disimpan sebagai `trip_timing` pada JSON rincian trip (cost_breakdown) dan diekspos di respons route version. Tidak diperlukan migrasi database atau paket tambahan. Versi rute lama/frozen dipertahankan; profil lama mendapat nilai default baru ketika dipakai pada optimasi berikutnya. Jalankan Re-Optimize untuk menerapkan parameter baru ke rute yang belum dijalankan.
+
+
+## Kontrol frozen trip dependency dan status dari Route Details
+
+- **LO Management → Lepas Dependency** tersedia untuk LO PLANNED dengan alasan `FROZEN_TRIP_DEPENDENCY`. Operator mengonfirmasi bahwa LO tidak perlu mengikuti trip tersebut. Pelepasan menghapus assignment operasional MT/trip/shipment/kompartemen dan planned gate-out; status tetap PLANNED. Karena hubungan trip dilepas, freeze rules tidak menguncinya kembali pada Re-Optimize berikutnya.
+- LO ONGOING dan DONE tidak dapat dilepas. LO PLANNED dengan alasan FREEZE_WINDOW memiliki tombol **Lepas Freeze Window** tersendiri, dengan konfirmasi dan pelepasan assignment yang sama. Audit dicatat sebagai `LO_FREEZE_WINDOW_RELEASE`. Kontrol dependency tetap khusus untuk pembekuan turunan karena LO lain dalam trip yang sama.
+- Pelepasan dicatat dalam audit `LO_DEPENDENCY_RELEASE`. Versi rute sebelumnya tetap utuh. Jika trip berjalan disalin ke versi berikutnya, waktu dan jalur fisik trip dipertahankan; keanggotaan LO pada stop hanya berisi LO yang masih dipertahankan, sehingga LO yang dilepas tidak diklaim dikirim dua kali.
+- **Route Plan → Route Details → Status Trip** menyediakan satu dropdown PLANNED, ONGOING, DONE pada header setiap trip di versi rute terbaru. Baris LO tidak memiliki dropdown status tersendiri. Nilai dropdown memakai status operasional yang sama dengan LO Management. Perubahan dari salah satu tampilan langsung tersinkron setelah server menyimpan data.
+- Perubahan status dari Route Details berlaku atomik untuk seluruh LO aktif yang masih tergabung dalam trip yang sama, termasuk LO dengan trip dependency. Dropdown disabled untuk LO yang dilepas/dibatalkan dan versi rute historis. Server menolak update dari versi rute yang sudah bukan current. Status per LO dari LO Management tetap dilindungi bila ada trip dependency.
+- Setelah melepas dependency, jalankan Re-Optimize untuk assignment baru. LO yang sudah dilepas tidak ikut pembaruan status trip lama dan tidak dapat dihubungkan kembali hanya dengan mengubah status dari versi lama.
+- Mengubah status satu LO ke ONGOING/DONE langsung memperbarui dependency LO PLANNED dalam trip yang sama. Mengembalikan sumber freeze ke PLANNED menghapus dependency yang tidak lagi memiliki sumber freeze.
+- Semua perubahan ditolak ketika Job CALCULATING. Tidak ada perubahan skema atau paket baru untuk installer.
+
+
+## Isolasi proses optimasi dan pencegahan API macet
+
+Endpoint optimize/reroute tetap mengembalikan HTTP 202. Background task hanya mengawasi proses Python terpisah (multiprocessing spawn); OR-Tools dan callback solver tidak lagi dijalankan di interpreter API. Setiap proses membuat koneksi database sendiri. Progress dan hasil tetap disimpan di database yang sama.
+
+Satu solver dijalankan pada satu waktu per instance API; job berikutnya menunggu dengan tahap QUEUED. Pengawas memeriksa proses setiap 0,5 detik dan menghentikan proses yang melewati batas tahap, termasuk bila macet pada pembangunan model atau propagasi awal sebelum OR-Tools dapat menjalankan search time limit.
+
+- BUILDING_MATRIX: batas matriks pada profile + 60 detik toleransi.
+- SOLVING_ROUTES: maksimum(30, 2 × route time limit + bay time limit) + 30 detik toleransi. Dua alokasi route mencakup solve awal dan shared post-bay repair budget.
+- PERSISTING_RESULT: route geometry time limit + 120 detik.
+- Persiapan proses: 120 detik.
+
+Timeout dicatat sebagai PHASE7_PROCESS_TIMEOUT; crash sebelum hasil terminal dicatat sebagai PHASE7_PROCESS_EXITED. Job tidak dibiarkan CALCULATING selamanya. Proses dihentikan sebelum menandai kegagalan, sehingga tidak dapat menulis hasil terlambat; hasil yang sudah berhasil commit tidak ditimpa. Snapshot rute lama dan cache yang sudah disimpan tetap dipertahankan.
+
+Mekanisme ini adalah proses anak yang diawasi API, bukan antrean durable terpisah. Ketika API direstart, proses aktif dihentikan dan startup recovery menandai job yang terputus sebagai FAILED untuk dicoba ulang oleh operator. Gunakan satu instance/proses API seperti konfigurasi Docker bawaan; startup recovery saat ini belum mendukung beberapa instance API yang aktif bersamaan.
+
+Model break menggunakan slack pada dimensi waktu yang sudah ada, sehingga tidak membuat ulang constraint waktu dan transit untuk setiap pasangan node. Aturan 4 jam mengemudi dan reset per trip tidak berubah. Tidak diperlukan paket baru atau perubahan installer.

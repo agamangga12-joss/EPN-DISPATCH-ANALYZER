@@ -10,9 +10,14 @@ Prinsip utama: jangan lanjut ke phase berikutnya sebelum phase berjalan benar, d
 
 ## Run
 
+Untuk Windows tanpa Docker, lihat [panduan lokal](docs/LOCAL_WINDOWS.md).
+Setelah runtime lokal disiapkan, jalankan `.\start-local.ps1`; hentikan dengan
+`.\stop-local.ps1`. Database lokal terpisah memakai port `5433`.
+
 ```bash
 cp .env.example .env
 # set GOOGLE_ROUTES_ENCRYPTION_KEY to a deployment-specific secret (minimum 16 chars)
+# set PGADMIN_DEFAULT_PASSWORD to a strong password for the pgAdmin web login
 docker compose up --build
 ```
 
@@ -22,7 +27,9 @@ Services:
 
 - API: `http://localhost:8000/api/v1/health`
 - Web: `http://localhost:3000`
+- Web juga dapat dibuka melalui `http://127.0.0.1:3000`. Biarkan `VITE_API_BASE_URL` kosong agar request `/api` diteruskan oleh web server ke API Docker tanpa masalah CORS. Untuk development di luar Docker, proxy memakai `http://127.0.0.1:8000` secara default; gunakan `API_PROXY_TARGET` bila backend berada di alamat lain.
 - PostgreSQL/PostGIS: `localhost:5432`
+- pgAdmin: `http://127.0.0.1:5051` (panduan: [Akses database dengan pgAdmin](docs/PGADMIN.md))
 - Phase 6 worker: service internal `phase6-worker`; status/log dapat diperiksa dengan `docker compose ps phase6-worker` dan `docker compose logs -f phase6-worker`
 
 Catatan lokal: jika port `3000` sudah terpakai, jalankan web dengan port lain, misalnya:
@@ -452,10 +459,23 @@ Operational Shift Intelligence tetap berbasis perilaku historis. Output ini tida
 
 Catatan scope: fondasi Phase 0 tetap menjadi dasar data utama dan Phase 2 tetap read-only historical intelligence. Prediction/availability Phase 6 dan dynamic route/bay optimization Phase 7 sudah tersedia sebagai modul terpisah; GPS-confirmed arrival/visit dan actual stop reconstruction tetap menunggu evidence GPS yang tervalidasi.
 
-Import workflow: create the depot manually in Master Data first. The system
-generates its immutable `depot_id`; copy that ID into every MT, SPBU, and
-Loading Order import row. Missing, deleted, or unknown depot IDs fail the whole
-import before canonical records are written.
+Import workflow: create the depot in Master Data, then select the active depot
+in the top bar, immediately left of Google Maps Settings. MT, SPBU, and
+Historikal Shipment uploads use that depot automatically; templates no longer
+contain depot IDs or names. The queued job captures the selected depot so
+switching depot later cannot redirect an upload. Dashboard, master records,
+exports, and analysis pages follow the active depot.
+
+Canonical columns and historical RTH rules are described in
+[Source Data Mapping](docs/SOURCE_DATA_MAPPING.md). RTH is Shipment End minus
+Gate Out; the median of distinct single-SPBU shipments becomes master RTH.
+Master travel time is half this duration as a one-way estimate, including
+service/waiting time. No valid history means NULL and zero samples. Import,
+CRUD edits, and deletion recalculate these values. Existing model/route
+snapshots remain auditable; rebuild analysis or create a new run to use new data.
+Legacy database fields remain compatibility mirrors, while templates, forms,
+and exports expose the consolidated inputs. Migration 0031 consolidates existing
+masters and calculates RTH from stored history; back up the database before upgrade.
 
 ## Local Tests
 
@@ -542,14 +562,14 @@ Progress yang sudah dibuat:
   - `master data MT.xlsx`: 162 rows
   - `master data spbu.xlsx`: 583 rows
   - `masterdata_LO.xlsx`: 4,462 rows, 1,876 grouped shipments
-- Upload import file lokal `.xlsx` atau `.csv`. Template MT, SPBU, dan LO mewajibkan `depot_id` yang sudah ada pada Master Depot.
+- Upload import file lokal `.xlsx` atau `.csv`. Template MT, SPBU, dan Historikal Shipment mengikuti depot aktif di top bar tanpa kolom depot.
 - Upload disimpan sebagai durable background job (`QUEUED` → `PROCESSING` → `PUBLISHED`/`FAILED`) agar file besar tidak menahan request API. Status import tetap dipantau setelah browser di-refresh dan tabel UI otomatis dimuat ulang ketika job selesai.
 - Export template.
 - Export data per depot.
 - Import audit dan import history.
 - RAW -> STAGING -> VALIDATION -> NORMALIZATION -> PUBLISH -> CANONICAL flow.
 - Canonical master MT dengan registration normalization.
-- Canonical master SPBU dengan coordinate parsing dari `source_coordinate`; format `lat long` dengan decimal comma diparse ke kolom `latitude` dan `longitude`.
+- Canonical master SPBU memakai `latitude` dan `longitude`; coordinate gabungan hanya diterima sebagai alias file lama. Waktu master dihitung otomatis dari historikal shipment.
 - Canonical depot dari source alias.
 - Product bootstrap dari Loading Order.
 - Tag splitting, tag master, tag type, MT tag bridge, SPBU tag bridge.
@@ -797,6 +817,7 @@ Input workbook:
 - card **Loading Order Upload** menyediakan **Data Demo**: user wajib memilih tanggal Loading Order dan memasukkan total order kelipatan 8 KL. Sistem membuat satu LO 8 KL per unit order pada tanggal pilihan, lalu hanya memilih SPBU aktif non-noise dengan `history_eligible=true` dan `coverage_source=BEHAVIORAL_HISTORY` pada saved model yang dipilih. Jam LO dibentuk dari shift snapshot model dalam batch cluster/dominant-shift bertimestamp berdekatan agar demo dapat menguji multi-SPBU. SPBU cold-start, inactive, noise, dan unseen tidak digunakan; input dengan sisa di bawah 8 KL ditolak
 - setelah file manual atau Data Demo LO tervalidasi, card **Loading Order Management** membuka seluruh row input—termasuk Product—untuk Add, Edit, dan Delete. Form Add/Edit memakai dropdown SPBU aktif dari Master SPBU pada depot terpilih dan dropdown Product aktif dari Master Product, bukan free text. Setiap header data memiliki filter dan sort, tabel dipaginasi, dan setiap perubahan membentuk ulang workbook aktif lalu menjalankan validator backend yang sama; hasil tabel inilah yang dikirim saat **Run Prediction**
 - card **MT Availability** hanya menyediakan **Import Data from Master Data**. Tombol ini mengambil seluruh MT canonical aktif pada depot terpilih dan membuka **MT Management** dengan kolom No MT, MT Tag Class, Status, dan ETA on Depot. Tidak tersedia Add/Delete; status Active/Deactive adalah state operasional run dan tidak menulis balik ke Master MT
+- Pada **4A. MT Management**, tombol **Bulk Action** di samping header Status dan ETA on Depot menerapkan status Active/Deactive atau tanggal/jam ETA serentak pada MT yang dicentang atau seluruh hasil pencarian lintas halaman. Pilihan MT bertahan saat berpindah halaman; checkbox header memilih semua hasil pencarian. Setiap bulk action menyusun ulang workbook MT availability dan menjalankan validator prediction yang sama dengan edit per baris.
 - seluruh MT hasil import mendapat ETA pada tanggal operasi dan jam awal Shift 1 dari snapshot model. MT dengan profil kapasitas 8 KL yang valid default Active; MT canonical aktif yang profil kapasitasnya tidak valid tetap ditampilkan tetapi default Deactive beserta alasannya. User dapat mengubah status atau ETA; hanya row Active yang dibentuk menjadi workbook internal, divalidasi backend, dan dikirim saat **Run Prediction**. ETA on Depot berarti waktu MT mulai available di depot
 - workbook internal hasil management langsung dipasang sebagai input aktif dan melewati validator yang sama; nomor MT, kapasitas, status operasional, dan timestamp ikut dipertahankan untuk audit
 - timestamp tanpa offset dibaca memakai timezone depot; normalized snapshot disimpan dalam UTC dan local time
@@ -932,6 +953,10 @@ Phase 7 adalah workspace operational control per depot dan operating date. Dispa
 Card **Job Management** memuat tombol **Create New Job**, pencarian lintas Job ID/nama/tanggal/depot/route/status, sorting pada setiap header data, pilihan 5/10/25/50 row, pagination, Open Job, dan Delete Job. Delete selalu meminta konfirmasi dan menghapus workspace operasional Phase 7 beserta versi/snapshot turunannya, tetapi tidak menghapus Prediction Run Phase 6 atau master data. Job berstatus `CALCULATING` tidak dapat dihapus; route-provider request log tetap dipertahankan sebagai audit evidence tanpa referensi Job.
 
 Tab **LO Management** dan **MT Management** menyediakan search, sorting pada setiap header data, pilihan jumlah row, serta pagination Previous/Next. LO Management menampilkan **System ETA Depot** dari trip tepat tempat LO tersebut ditugaskan: semua LO Trip 1 memakai waktu kembali Trip 1, semua LO Trip 2 memakai waktu kembali Trip 2, dan seterusnya; sebelum ada current route assignment nilainya kosong. Select-all LO berlaku pada halaman aktif, sementara perubahan draft ETA/status MT tetap dipertahankan saat user mencari, mengurutkan, atau berpindah halaman. MT Management memiliki **Delivery Status** turunan dari status LO assignment aktif: `ONGOING` menang bila ada LO ongoing, jika tidak `DONE` menang bila ada LO done, sedangkan MT dengan hanya LO planned atau tanpa assignment tampil `PLANNED`. System ETA pada MT hanya tampil ketika Delivery Status `ONGOING` dan nilainya sama dengan return ETA trip current-version tempat LO ongoing tersebut berada; pada status lainnya System ETA tampil kosong. Karena nilai ini dihitung dari LO, Apply Operational Update langsung tercermin setelah workspace di-refresh tanpa menyimpan sumber status kedua. Tab **Bay Management** menyediakan Delete Bay dengan konfirmasi; bay dikeluarkan dari konfigurasi aktif secara soft-delete dan current occupancy/queue terkait dibersihkan, sedangkan snapshot serta histori route/bay assignment tetap auditable. Grid kecepatan pengisian product memisahkan nama product, input angka, dan unit `min / compartment` agar label panjang tidak bertumpuk.
+
+Bulk action MT Phase 7 tersedia di samping header **Operational Status** dan **Planned ETA Depot**. Pilih MT melalui checkbox lintas halaman, atau terapkan ke seluruh hasil pencarian. Active memakai `READY`, Deactive memakai `UNAVAILABLE`. Bulk hanya mengirim field yang dipilih untuk MT target; draft perubahan lain tetap tersimpan di workspace.
+
+Pada tab **MT Management**, **Template MT Readiness** mengunduh Excel `.xlsx` dengan kolom **MT REGISTRATION**, **OPERATIONAL STATUS**, dan **PLANNED ETA DEPOT**. Registrasi otomatis mencakup seluruh MT yang dimuat pada Job aktif, lintas halaman dan filter; status serta ETA memakai nilai tersimpan saat template diunduh. **Import Excel MT Readiness** menyimpan perubahan berdasarkan registrasi tanpa perlu Apply MT Update. Gunakan status `READY`, `ON_TRIP`, `RETURNING`, `QUEUEING`, `LOADING`, atau `UNAVAILABLE` dan sel tanggal Excel/teks `YYYY-MM-DD HH:MM:SS` dalam timezone depot. Kolom kosong mempertahankan nilai; baris yang tidak ingin diperbarui dapat dihapus. Seluruh workbook divalidasi sebelum perubahan disimpan: registrasi asing/duplikat, formula, status tidak valid, serta tanggal salah membatalkan seluruh upload dengan rincian nomor baris. Upload dinonaktifkan ketika Job sedang menghitung optimasi.
 
 Lifecycle ETA MT memakai `planned_eta_depot` sebagai satu-satunya input availability untuk Initial dan Reroute. Semua MT wajib memiliki Planned ETA dan nilainya harus sama atau lebih lambat dari waktu optimasi pilihan dispatcher; optimasi 00:00 dengan Planned ETA 00:00 valid, sedangkan optimasi 12:00 dengan Planned ETA 07:00 ditolak sebelum Job masuk `CALCULATING`. Setelah hasil berhasil dipersist, Planned ETA otomatis di-reset menjadi `null`; run gagal tidak menghapus input. `system_eta_depot` masih `null` sebelum V1 karena belum ada hasil kalkulasi. Pada MT Management, System ETA hanya ditampilkan untuk MT berstatus `ONGOING` dan mengambil `estimated_return_depot` trip current-version yang berisi LO ongoing tersebut—termasuk Trip 2 bila Trip 2 sedang berlangsung. MT berstatus `PLANNED`, `DONE`, atau tanpa LO ongoing menampilkan System ETA `null`. User ETA Override telah dikeluarkan dari API, UI, dan perhitungan solver; kolom database legacy dipertahankan kosong untuk kompatibilitas skema.
 

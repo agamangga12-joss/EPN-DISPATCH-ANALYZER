@@ -56,7 +56,7 @@ def build_tag_consistency_payload(
     search: str | None = None,
     sort_column: str = "loading_order_date",
     sort_direction: str = "desc",
-    limit: int = 25,
+    limit: int | None = 25,
     offset: int = 0,
 ) -> dict:
     latest_date = latest_loading_order_date(db, depot_id=depot_id)
@@ -80,7 +80,7 @@ def build_tag_consistency_payload(
     analyses = apply_analysis_filters(analyses, tag_type=tag_type, overall_status=overall_status, search=search)
     summary = summarize_analyses(analyses)
     sorted_analyses = sort_analyses(analyses, sort_column, sort_direction)
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 500)) if limit is not None else None
     offset = max(0, offset)
     return {
         "latest_loading_order_date": latest_date.isoformat() if latest_date else None,
@@ -101,7 +101,7 @@ def build_tag_consistency_payload(
         "total": len(sorted_analyses),
         "limit": limit,
         "offset": offset,
-        "rows": sorted_analyses[offset : offset + limit],
+        "rows": sorted_analyses[offset : offset + limit] if limit is not None else sorted_analyses,
     }
 
 

@@ -72,6 +72,7 @@ from .phase7_constants import (
     effective_parameters,
 )
 from .phase7_matrix import RouteMatrixService
+from .restricted_roads import RestrictedRoadRouter, RestrictedRoutingError, geometry_conflicts, restriction_snapshot, missing_detours
 from .phase7_optimization import OptimizationCoordinatorService
 
 
@@ -224,6 +225,72 @@ def _require_job(db: Session, job_id: str) -> OptimizationJob:
     if not job:
         raise HTTPException(status_code=404, detail={"code": "PHASE7_JOB_NOT_FOUND", "message": "Phase 7 Job was not found."})
     return job
+
+
+def _editable_job(db: Session, job_id: str) -> OptimizationJob:
+    job = _require_job(db, job_id)
+    job = db.scalar(select(OptimizationJob).where(OptimizationJob.job_id == job.job_id).with_for_update().execution_options(populate_existing=True))
+    if job.status == "CALCULATING":
+        raise HTTPException(409, detail={"code": "PHASE7_JOB_CALCULATING", "message": "Wait until optimization finishes before changing this Job."})
+    return job
+
+
+def job_lo_options(db: Session, job_id: str) -> list[dict]:
+    job = _require_job(db, job_id)
+    return [{"spbu_id": row.spbu_id, "spbu_code": row.spbu_code, "spbu_name": row.spbu_name}
+            for row in db.scalars(select(MasterSPBU).where(MasterSPBU.primary_depot_id == job.depot_id, MasterSPBU.active_status == "ACTIVE").order_by(MasterSPBU.spbu_code)).all()]
+
+
+def add_job_lo(db: Session, job_id: str, payload: dict, *, actor: str = "local-user") -> dict:
+    job = _editable_job(db, job_id)
+    if not job.source_prediction_run_id:
+        raise HTTPException(422, detail={"code": "PREDICTION_RUN_REQUIRED", "message": "Load the Phase 6 source before adding an operational LO."})
+    lo_id = str(payload["loading_order_id"]).strip()
+    volume = float(payload["volume_kl"])
+    if not lo_id or len(lo_id) > 120 or not math.isfinite(volume) or volume <= 0:
+        raise HTTPException(422, detail={"code": "INVALID_LO", "message": "LO number and positive finite volume are required."})
+    if db.scalar(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.loading_order_id == lo_id)):
+        raise HTTPException(409, detail={"code": "DUPLICATE_LO", "message": "LO number already exists in this Job, including cancelled LO."})
+    spbu = db.get(MasterSPBU, payload["spbu_id"])
+    product = db.get(MasterProduct, payload["product_id"])
+    if not spbu or spbu.primary_depot_id != job.depot_id or spbu.active_status != "ACTIVE":
+        raise HTTPException(422, detail={"code": "INVALID_SPBU", "message": "Select an active SPBU belonging to this Job depot."})
+    if not product or product.active_status != "ACTIVE":
+        raise HTTPException(422, detail={"code": "INVALID_PRODUCT", "message": "Select an active master product."})
+    db.add(LOOperationalState(lo_state_id=uuid.uuid4().hex, job_id=job.job_id, loading_order_id=lo_id,
+        spbu_id=spbu.spbu_id, spbu_name_snapshot=spbu.spbu_name, product_id=product.product_id,
+        product_name_snapshot=product.product_name, volume_kl=volume, depot_id=job.depot_id,
+        operating_date=job.operating_date, source_prediction_run_id=job.source_prediction_run_id,
+        status="PLANNED", frozen=False, updated_by=actor))
+    job.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "ADDED", "loading_order_id": lo_id}
+
+
+def cancel_job_los(db: Session, job_id: str, lo_ids: list[str], *, actor: str = "local-user") -> dict:
+    job = _editable_job(db, job_id)
+    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    selected = {row.loading_order_id: row for row in rows if row.loading_order_id in lo_ids}
+    if set(lo_ids) != set(selected):
+        raise HTTPException(404, detail={"code": "LO_NOT_FOUND", "message": "One or more LO does not belong to this Job."})
+    executed_trips = {(row.current_vehicle_id, row.current_trip_number) for row in rows if row.status in {"ONGOING", "DONE"} and row.current_vehicle_id and row.current_trip_number is not None}
+    if any(row.status != "PLANNED" or row.frozen or (row.current_vehicle_id, row.current_trip_number) in executed_trips for row in selected.values()):
+        raise HTTPException(409, detail={"code": "LO_LOCKED", "message": "Ongoing, completed, frozen LO or LO in an executed trip cannot be cancelled."})
+    for row in selected.values():
+        row.user_cancelled = True
+        row.updated_by = actor
+    job.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "CANCELLED", "loading_order_ids": sorted(selected)}
+
+
+def _job_mt_tags(db: Session, vehicles: list[VehicleOperationalState]) -> tuple[dict, dict]:
+    ids = [row.mt_id for row in vehicles]
+    tags, _, labels = _tags(db, ids, [])
+    options = {row.mt_id: [{"tag_id": tag_id, "tag_value": labels[tag_id]} for tag_id in sorted(tags[row.mt_id], key=lambda key: labels[key])] for row in vehicles}
+    for row in vehicles:
+        tags[row.mt_id] -= set(row.disabled_tag_ids or [])
+    return tags, options
 
 
 def _require_version(db: Session, job: OptimizationJob, version_id: str | None = None) -> RouteVersion:
@@ -437,7 +504,7 @@ def delete_job(db: Session, job_id: str) -> dict:
 
 def _job_summary(db: Session, job: OptimizationJob) -> dict:
     depot = db.get(MasterDepot, job.depot_id)
-    lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(False))).all()
     mt_count = db.scalar(select(func.count()).select_from(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)) or 0
     version = db.get(RouteVersion, job.current_route_version_id) if job.current_route_version_id else None
     return {
@@ -458,7 +525,7 @@ def _job_summary(db: Session, job: OptimizationJob) -> dict:
 
 
 def _job_kpis(db: Session, job: OptimizationJob) -> dict:
-    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(False))).all()
     statuses = Counter(row.status for row in rows)
     version = db.get(RouteVersion, job.current_route_version_id) if job.current_route_version_id else None
     summary = version.summary_snapshot if version else {}
@@ -511,6 +578,11 @@ def get_job(db: Session, job_id: str) -> dict:
             "error_code": latest_run.error_code,
             "error_message": latest_run.error_message,
         }
+    if job.status == "CALCULATING" and (not latest_run or latest_run.status != "RUNNING"):
+        optimization = {"run_id": "", "run_type": "REROUTE" if current else "INITIAL", "status": "QUEUED",
+                        "solver_status": "PENDING", "stage": "QUEUED", "progress_pct": 0, "elapsed_ms": 0,
+                        "started_at": None, "ended_at": None, "optimization_reference_time": None,
+                        "metadata": {"execution_mode": "ISOLATED_PROCESS"}, "error_code": None, "error_message": None}
     return {
         **_job_summary(db, job),
         "header": {
@@ -573,7 +645,7 @@ def list_prediction_runs_for_job(db: Session, job_id: str) -> list[dict]:
 
 
 def load_prediction_run(db: Session, job_id: str, run_id: str, *, actor: str = "local-user") -> dict:
-    job = _require_job(db, job_id)
+    job = _editable_job(db, job_id)
     run = db.get(PredictionRun, run_id) or db.scalar(select(PredictionRun).where(PredictionRun.prediction_run_no == run_id))
     if not run or run.status != "COMPLETED":
         raise HTTPException(status_code=422, detail={"code": "INVALID_PHASE6_RUN", "message": "Select a completed/saved Phase 6 Prediction Run."})
@@ -636,7 +708,7 @@ def load_prediction_run(db: Session, job_id: str, run_id: str, *, actor: str = "
 
 def list_job_los(db: Session, job_id: str) -> list[dict]:
     job = _require_job(db, job_id)
-    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id).order_by(LOOperationalState.loading_order_id)).all()
+    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(False)).order_by(LOOperationalState.loading_order_id)).all()
     mt_ids = {row.phase6_predicted_vehicle_id for row in rows if row.phase6_predicted_vehicle_id} | {row.current_vehicle_id for row in rows if row.current_vehicle_id}
     mts = {row.mt_id: row for row in db.scalars(select(MasterMT).where(MasterMT.mt_id.in_(mt_ids))).all()} if mt_ids else {}
     system_eta_by_lo: dict[str, datetime] = {}
@@ -689,14 +761,82 @@ def list_job_los(db: Session, job_id: str) -> list[dict]:
     ]
 
 
-def update_lo_statuses(db: Session, job_id: str, updates: list[dict], *, actor: str = "local-user") -> dict:
-    job = _require_job(db, job_id)
+def _sync_trip_dependencies(rows):
+    for row in rows:
+        if row.frozen_reason == "FROZEN_TRIP_DEPENDENCY":
+            row.frozen, row.frozen_reason = False, None
+    groups = {(row.current_vehicle_id, row.current_trip_number) for row in rows
+              if not row.user_cancelled and row.frozen and row.current_vehicle_id and row.current_trip_number is not None}
+    for row in rows:
+        if not row.user_cancelled and row.status == "PLANNED" and not row.frozen and (row.current_vehicle_id, row.current_trip_number) in groups:
+            row.frozen, row.frozen_reason = True, "FROZEN_TRIP_DEPENDENCY"
+
+
+def release_lo_dependencies(db: Session, job_id: str, lo_ids: list[str], *, actor: str = "local-user", freeze_window: bool = False) -> dict:
+    job = _editable_job(db, job_id)
+    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    _sync_trip_dependencies(rows)
+    selected = {row.loading_order_id: row for row in rows if row.loading_order_id in lo_ids}
+    if set(selected) != set(lo_ids):
+        raise HTTPException(404, detail={"code": "LO_NOT_FOUND", "message": "LO does not belong to this Job."})
+    reason = "FREEZE_WINDOW" if freeze_window else "FROZEN_TRIP_DEPENDENCY"
+    if any(row.user_cancelled or row.status != "PLANNED" or row.frozen_reason != reason for row in selected.values()):
+        raise HTTPException(409, detail={"code": "LO_FREEZE_WINDOW_RELEASE_NOT_ALLOWED" if freeze_window else "LO_DEPENDENCY_RELEASE_NOT_ALLOWED", "message": f"Only PLANNED LO frozen by {reason} can be released."})
+    for row in selected.values():
+        before = {"loading_order_id": row.loading_order_id, "vehicle_id": row.current_vehicle_id, "trip_number": row.current_trip_number,
+                  "shipment_id": row.current_shipment_id, "compartment_id": row.current_compartment_id, "planned_gate_out": _iso(row.planned_gate_out)}
+        db.add(ActualVehicleEvent(vehicle_event_id=uuid.uuid4().hex, job_id=job.job_id, mt_id=row.current_vehicle_id,
+            event_type="LO_FREEZE_WINDOW_RELEASE" if freeze_window else "LO_DEPENDENCY_RELEASE", event_time=datetime.now(timezone.utc), source="USER", details={"before": {**before, "frozen_reason": reason}, "updated_by": actor}))
+        row.current_vehicle_id = row.current_trip_number = row.current_shipment_id = row.current_compartment_id = row.planned_gate_out = None
+        row.frozen, row.frozen_reason = False, None
+        row.updated_by = actor
+    _sync_trip_dependencies(rows)
+    job.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "RELEASED", "loading_order_ids": sorted(selected)}
+
+
+def update_lo_statuses(db: Session, job_id: str, updates: list[dict], *, actor: str = "local-user", route_version_id: str | None = None) -> dict:
+    job = _editable_job(db, job_id)
     rows = {row.loading_order_id: row for row in db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()}
+    _sync_trip_dependencies(list(rows.values()))
+    if route_version_id and route_version_id != job.current_route_version_id:
+        raise HTTPException(409, detail={"code": "STALE_ROUTE_VERSION", "message": "Operational status can only be edited from the current Route Version."})
+    if route_version_id:
+        assignments = {item.loading_order_id: item for item in db.scalars(select(RouteVersionLOAssignment).where(RouteVersionLOAssignment.route_version_id == route_version_id)).all()}
+        expanded = {}
+        for update in updates:
+            lo_id = str(update.get("loading_order_id"))
+            row, assignment = rows.get(lo_id), assignments.get(lo_id)
+            if not row or not assignment:
+                raise HTTPException(409, detail={"code": "LO_NOT_IN_ROUTE", "message": "LO does not belong to the selected Route Version."})
+            if row.user_cancelled or not row.current_vehicle_id or row.current_trip_number is None or row.current_vehicle_id != assignment.vehicle_id or row.current_trip_number != assignment.trip_number or not assignment.route_version_trip_id:
+                raise HTTPException(409, detail={"code": "LO_DETACHED_FROM_TRIP", "message": "This LO no longer belongs to this trip. Re-Optimize before updating its trip status."})
+            members = [member for member in rows.values() if not member.user_cancelled
+                       and member.current_vehicle_id == row.current_vehicle_id and member.current_trip_number == row.current_trip_number
+                       and member.loading_order_id in assignments
+                       and assignments[member.loading_order_id].route_version_trip_id == assignment.route_version_trip_id]
+            for member in members:
+                item = {**update, "loading_order_id": member.loading_order_id}
+                previous = expanded.get(member.loading_order_id)
+                if previous and str(previous.get("status")).upper() != str(item.get("status")).upper():
+                    raise HTTPException(409, detail={"code": "CONFLICTING_TRIP_STATUS", "message": "All LO in one trip must receive the same operational status."})
+                expanded[member.loading_order_id] = item
+        updates = list(expanded.values())
+    # Validate the whole batch before changing any status.
+    for item in updates:
+        row = rows.get(str(item.get("loading_order_id")))
+        if not route_version_id and row and row.frozen_reason == "FROZEN_TRIP_DEPENDENCY":
+            raise HTTPException(409, detail={"code": "LO_TRIP_DEPENDENCY_LOCKED", "message": "Release this LO trip dependency in LO Management before changing its status."})
+        if route_version_id and not db.scalar(select(RouteVersionLOAssignment).where(RouteVersionLOAssignment.route_version_id == route_version_id, RouteVersionLOAssignment.loading_order_id == str(item.get("loading_order_id")))):
+            raise HTTPException(409, detail={"code": "LO_NOT_IN_ROUTE", "message": "LO does not belong to the selected Route Version."})
     changed = []
     for update in updates:
         row = rows.get(str(update.get("loading_order_id")))
         if not row:
             raise HTTPException(status_code=404, detail={"code": "LO_NOT_FOUND", "message": f"LO {update.get('loading_order_id')} was not found in this Job."})
+        if row.user_cancelled:
+            raise HTTPException(409, detail={"code": "LO_CANCELLED", "message": "Cancelled LO cannot receive operational status updates."})
         status = str(update.get("status") or "").upper()
         if status not in LO_STATUSES:
             raise HTTPException(status_code=400, detail={"code": "INVALID_LO_STATUS", "message": f"Unsupported LO status: {status}."})
@@ -717,12 +857,14 @@ def update_lo_statuses(db: Session, job_id: str, updates: list[dict], *, actor: 
             row.frozen = False
             row.frozen_reason = None
         changed.append({"loading_order_id": row.loading_order_id, "before": before, "after": status})
+    _sync_trip_dependencies(list(rows.values()))
+    job.updated_at = datetime.now(timezone.utc)
     db.commit()
     return {"status": "APPLIED", "changed": changed, "job": get_job(db, job.job_id)}
 
 
 def load_mt_from_master(db: Session, job_id: str, *, actor: str = "local-user") -> dict:
-    job = _require_job(db, job_id)
+    job = _editable_job(db, job_id)
     mts = db.scalars(select(MasterMT).where(MasterMT.depot_id == job.depot_id, MasterMT.active_status == "ACTIVE").order_by(MasterMT.vehicle_registration)).all()
     existing = {row.mt_id: row for row in db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()}
     mt_ids = [row.mt_id for row in mts]
@@ -765,6 +907,7 @@ def load_mt_from_master(db: Session, job_id: str, *, actor: str = "local-user") 
 def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
     job = _require_job(db, job_id)
     rows = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id).order_by(VehicleOperationalState.registration_snapshot)).all()
+    effective_tags, tag_options = _job_mt_tags(db, rows)
     lo_statuses_by_mt: dict[str, set[str]] = defaultdict(set)
     for mt_id, lo_status in db.execute(
         select(LOOperationalState.current_vehicle_id, LOOperationalState.status).where(
@@ -824,7 +967,9 @@ def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
             "mt_id": row.mt_id,
             "registration": row.registration_snapshot,
             "vehicle_class": row.vehicle_class,
-            "tags": row.tag_snapshot,
+            "tags": [item["tag_value"] for item in tag_options[row.mt_id] if item["tag_id"] in effective_tags[row.mt_id]],
+            "master_tags": tag_options[row.mt_id],
+            "disabled_tag_ids": row.disabled_tag_ids or [],
             "capacity_kl": row.capacity_kl,
             "number_of_compartments": row.number_of_compartments,
             "compartments": row.compartment_configuration,
@@ -845,13 +990,29 @@ def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
 
 
 def update_vehicle_states(db: Session, job_id: str, updates: list[dict], *, actor: str = "local-user") -> dict:
-    job = _require_job(db, job_id)
+    job = _editable_job(db, job_id)
     rows = {row.mt_id: row for row in db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()}
+    _, tag_options = _job_mt_tags(db, list(rows.values()))
+    # Validate all exclusions before applying any row in this batch.
+    for update in updates:
+        if "disabled_tag_ids" in update:
+            valid = {item["tag_id"] for item in tag_options.get(str(update.get("mt_id")), [])}
+            if update["disabled_tag_ids"] is None or not set(update["disabled_tag_ids"]) <= valid:
+                raise HTTPException(422, detail={"code": "INVALID_MT_TAGS", "message": "Only this MT's master tags can be disabled."})
     changed = []
     for update in updates:
         row = rows.get(str(update.get("mt_id")))
         if not row:
             raise HTTPException(status_code=404, detail={"code": "MT_NOT_LOADED", "message": f"MT {update.get('mt_id')} is not loaded in this Job."})
+        previous_disabled_tags = list(row.disabled_tag_ids or [])
+        if "disabled_tag_ids" in update:
+            previous_tags = list(row.disabled_tag_ids or [])
+            row.disabled_tag_ids = sorted(set(update["disabled_tag_ids"]))
+            if previous_tags != row.disabled_tag_ids:
+                db.add(ActualVehicleEvent(vehicle_event_id=uuid.uuid4().hex, job_id=job.job_id, mt_id=row.mt_id,
+                    event_type="TAG_UPDATE", event_time=datetime.now(timezone.utc), source="USER",
+                    details={"before_disabled_tag_ids": previous_tags, "after_disabled_tag_ids": row.disabled_tag_ids, "updated_by": actor}))
+            job.updated_at = datetime.now(timezone.utc)
         before = {"effective_eta_depot": _iso(row.effective_eta_depot), "operational_status": row.operational_status}
         if "planned_eta_depot" in update:
             row.planned_eta_depot = datetime.fromisoformat(str(update["planned_eta_depot"]).replace("Z", "+00:00")) if update["planned_eta_depot"] else None
@@ -874,6 +1035,8 @@ def update_vehicle_states(db: Session, job_id: str, updates: list[dict], *, acto
             changed.append({"mt_id": row.mt_id, "before": before, "after": after})
             if row.effective_eta_depot:
                 db.add(ActualVehicleEvent(vehicle_event_id=uuid.uuid4().hex, job_id=job.job_id, mt_id=row.mt_id, event_type="ETA_DEPOT_UPDATE", event_time=row.effective_eta_depot, source="USER", details={"before": before, "after": after, "updated_by": actor}))
+        if previous_disabled_tags != list(row.disabled_tag_ids or []):
+            changed.append({"mt_id": row.mt_id, "before": {"disabled_tag_ids": previous_disabled_tags}, "after": {"disabled_tag_ids": row.disabled_tag_ids}})
     db.commit()
     return {"status": "APPLIED", "changed": changed, "vehicles": list_job_vehicles(db, job.job_id)}
 
@@ -1117,16 +1280,25 @@ def route_time_limit_recommendation(
     }
 
 
-def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> dict:
+def validate_job(db: Session, job_id: str, parameters: dict | None = None, *, reference_time: datetime | None = None) -> dict:
     job = _require_job(db, job_id)
     ensure_default_parameter_profiles(db)
     parameters = effective_parameters(parameters or {})
     messages: list[dict] = []
     def add(code: str, level: str, message: str) -> None:
         messages.append({"code": code, "level": level, "message": message})
-    lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(False))).all()
     depot = db.get(MasterDepot, job.depot_id)
     vehicles = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()
+    road_snapshot = restriction_snapshot(db, job.depot_id, reference_time or _job_day(job, depot)[0]) if depot else {"roads": []}
+    if road_snapshot["roads"]:
+        if not RestrictedRoadRouter(db).enabled:
+            add("GOOGLE_ROUTES_REQUIRED", "BLOCKED", "Restricted roads require a valid Google Routes API key in Google Maps Integration.")
+        else:
+            add("RESTRICTED_ROADS_ACTIVE", "WARNING", f"{len(road_snapshot['roads'])} restricted road(s) apply. Google Routes will verify geometry and use operator detour waypoints where needed.")
+    incomplete_roads = missing_detours(road_snapshot["roads"])
+    if incomplete_roads:
+        add("RESTRICTED_DETOUR_REQUIRED", "BLOCKED", f"Complete alternative waypoints for {len(incomplete_roads)} active restricted road(s) in Master Restricted Roads.")
     optimizable_lo_count = sum(
         1
         for row in lo_rows
@@ -1143,7 +1315,11 @@ def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> di
     if not job.source_prediction_run_id:
         add("PREDICTION_RUN_REQUIRED", "BLOCKED", "Load a completed Phase 6 Prediction Run by Run ID.")
     if not lo_rows:
-        add("LO_REQUIRED", "BLOCKED", "No Phase 7 LO has been imported.")
+        cancelled_count = db.scalar(select(func.count()).select_from(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(True))) or 0
+        if cancelled_count:
+            add("ALL_LO_CANCELLED", "WARNING", "All operational LO were cancelled. The next route version will contain no deliveries.")
+        else:
+            add("LO_REQUIRED", "BLOCKED", "No Phase 7 LO has been imported.")
     if not vehicles:
         add("MT_REQUIRED", "BLOCKED", "Load MT from the selected depot master data.")
     if not depot or depot.depot_operational_start is None or depot.depot_operational_end is None:
@@ -1172,6 +1348,7 @@ def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> di
         spbu_ids = sorted({row.spbu_id for row in lo_rows if row.spbu_id})
         mt_ids = [row.mt_id for row in vehicles]
         mt_tags, spbu_tags, tag_labels = _tags(db, mt_ids, spbu_ids)
+        mt_tags, _ = _job_mt_tags(db, vehicles)
         master_mt = {mt_id: db.get(MasterMT, mt_id) for mt_id in mt_ids}
         master_spbu = {spbu_id: db.get(MasterSPBU, spbu_id) for spbu_id in spbu_ids}
         incompatible_los = []
@@ -1266,7 +1443,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     depot = db.get(MasterDepot, job.depot_id)
     assert depot is not None
     day_start, operational_start, operational_end = _job_day(job, depot)
-    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id).order_by(LOOperationalState.loading_order_id)).all()
+    rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(False)).order_by(LOOperationalState.loading_order_id)).all()
     if reroute:
         apply_freeze_rules(
             rows,
@@ -1392,6 +1569,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     spbu_ids = sorted({row.spbu_id for row in optimizable})
     spbus = {spbu_id: db.get(MasterSPBU, spbu_id) for spbu_id in spbu_ids}
     mt_tags, spbu_tags, labels = _tags(db, list(mts), spbu_ids)
+    mt_tags, _ = _job_mt_tags(db, vehicle_rows)
     historical_affinity: dict[tuple[str, str], tuple[datetime, float]] = {}
     if spbu_ids and mts:
         for row in db.scalars(
@@ -1533,7 +1711,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             "mt_id": row.mt_id,
             "registration": row.registration_snapshot,
             "vehicle_class": row.vehicle_class,
-            "tags": row.tag_snapshot,
+            "tags": sorted(labels[tag_id] for tag_id in mt_tags[row.mt_id]),
             "capacity_kl": row.capacity_kl,
             "compartments": row.compartment_configuration,
             "availability_eta_depot": _utc(row.planned_eta_depot),
@@ -1811,11 +1989,16 @@ def _copy_frozen_plan(
         and row.route_version_trip_id
     }
     previous_trips = db.scalars(select(RouteVersionTrip).where(RouteVersionTrip.route_version_trip_id.in_(previous_trip_ids))).all() if previous_trip_ids else []
+    retained = {row.loading_order_id: row for row in frozen_rows}
     trip_map: dict[str, RouteVersionTrip] = {}
     for old in previous_trips:
         estimated_return_depot = old.estimated_return_depot
         operating_minutes = old.operating_minutes
         cost_breakdown = dict(old.cost_breakdown or {})
+        released_ids = sorted(lo_id for lo_id, assignment in previous_assignments.items()
+                              if assignment.route_version_trip_id == old.route_version_trip_id and lo_id not in retained)
+        if released_ids:
+            cost_breakdown["released_loading_order_ids"] = released_ids
         actual_return = (ongoing_return_by_mt or {}).get(old.vehicle_id) if old.route_version_trip_id in ongoing_trip_ids else None
         if actual_return is not None:
             estimated_return_depot = max(_utc(actual_return), _utc(old.gate_out))
@@ -1845,7 +2028,11 @@ def _copy_frozen_plan(
         db.flush()
         trip_map[old.route_version_trip_id] = new
         for stop in db.scalars(select(RouteVersionStop).where(RouteVersionStop.route_version_trip_id == old.route_version_trip_id)).all():
-            db.add(RouteVersionStop(route_version_stop_id=uuid.uuid4().hex, route_version_trip_id=new.route_version_trip_id, sequence_number=stop.sequence_number, stop_type=stop.stop_type, spbu_id=stop.spbu_id, arrival_time=stop.arrival_time, departure_time=stop.departure_time, service_minutes=stop.service_minutes, distance_from_previous_meters=stop.distance_from_previous_meters, travel_from_previous_seconds=stop.travel_from_previous_seconds, loading_order_ids=stop.loading_order_ids, products=stop.products, volume_kl=stop.volume_kl))
+            kept_ids = [lo_id for lo_id in (stop.loading_order_ids or []) if lo_id in retained]
+            removed_ids = set(stop.loading_order_ids or []) - set(kept_ids)
+            # Preserve the executed stop's timing and geometry, but do not
+            # claim that a manually released LO is still carried on this trip.
+            db.add(RouteVersionStop(route_version_stop_id=uuid.uuid4().hex, route_version_trip_id=new.route_version_trip_id, sequence_number=stop.sequence_number, stop_type=stop.stop_type, spbu_id=stop.spbu_id, arrival_time=stop.arrival_time, departure_time=stop.departure_time, service_minutes=stop.service_minutes, distance_from_previous_meters=stop.distance_from_previous_meters, travel_from_previous_seconds=stop.travel_from_previous_seconds, loading_order_ids=kept_ids, products=sorted({retained[lo_id].product_id for lo_id in kept_ids if retained[lo_id].product_id}) if removed_ids else stop.products, volume_kl=sum(retained[lo_id].volume_kl for lo_id in kept_ids) if removed_ids else stop.volume_kl))
         old_bay = db.scalar(
             select(OptimizationBayAssignment).where(
                 OptimizationBayAssignment.route_version_trip_id == old.route_version_trip_id
@@ -2028,7 +2215,7 @@ def _prepare_optimization(
         initial_reference_time=initial_reference_time,
         latest_reference_time=latest_reference_time,
     )
-    current_lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    current_lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id, LOOperationalState.user_cancelled.is_(False))).all()
     if current_lo_rows and all(row.status == "DONE" for row in current_lo_rows):
         job.status = "CLOSED"
         job.closed_at = datetime.now(timezone.utc)
@@ -2076,7 +2263,13 @@ def _prepare_optimization(
         parameters = effective_parameters({**profile_parameters, **(payload.get("parameters") or {})})
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_PHASE7_PARAMETER", "message": str(exc)}) from exc
-    validation = validate_job(db, job.job_id, parameters)
+    # This snapshot is server-owned; request/profile data cannot disable it.
+    parameters["restricted_roads"] = restriction_snapshot(db, job.depot_id, current_time)
+    road_router = RestrictedRoadRouter(db)
+    parameters["restricted_routing_provider"] = {"provider": "GOOGLE_RESTRICTED_WAYPOINTS", "configuration_version": road_router.configuration_version, "max_attempts_per_pair": road_router.MAX_ATTEMPTS}
+    if parameters["restricted_roads"]["roads"] and not road_router.enabled:
+        raise HTTPException(status_code=422, detail={"code": "GOOGLE_ROUTES_REQUIRED", "message": "Configure a valid Google Routes API key in Google Maps Integration."})
+    validation = validate_job(db, job.job_id, parameters, reference_time=current_time)
     if validation["status"] == "BLOCKED":
         raise HTTPException(status_code=422, detail={"code": "JOB_VALIDATION_BLOCKED", "message": "Phase 7 Job validation is blocked.", "validation": validation})
     route_limit = validation.get("route_time_limit_recommendation") or route_time_limit_recommendation(
@@ -2118,8 +2311,10 @@ def enqueue_optimization(db: Session, job_id: str, payload: dict, *, reroute: bo
     prepared = _prepare_optimization(db, job_id, payload, reroute=reroute, lock_job=True)
     job = prepared["job"]
     _align_bay_state_reference_time(db, job, prepared["current_time"])
-    job.status = "CALCULATING"
-    job.error_message = None
+    reserved = db.execute(update(OptimizationJob).where(OptimizationJob.job_id == job.job_id, OptimizationJob.status != "CALCULATING").values(status="CALCULATING", error_message=None))
+    if reserved.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, detail={"code": "OPTIMIZATION_ALREADY_RUNNING", "message": "This Job is already calculating."})
     db.commit()
     return {
         "job_id": job.job_id,
@@ -2190,6 +2385,7 @@ def run_optimization(
                 "progress_pct": 5,
                 "optimization_reference_time": _iso(current_time),
                 "optimization_timezone": _timezone(depot).key,
+                "restricted_roads": parameters.get("restricted_roads"),
                 "route_time_limit_recommendation": route_limit,
                 "route_time_limit_confirmed": route_limit_confirmed,
                 "route_warm_start_source": inputs["route_warm_start_source"],
@@ -2259,7 +2455,7 @@ def run_optimization(
             for row in result["dropped"]:
                 row["reason_code"] = "UNSERVED_END_OF_DAY"
                 row["reason_description"] = "LO remains unserved because the depot operating time has ended; classify it as DROPPED or CARRY_OVER in the next operational workflow."
-        if not inputs["loading_orders"] and any(row.frozen for row in inputs["all_lo_rows"]):
+        if not inputs["loading_orders"]:
             result["solver_status"] = "FEASIBLE"
         version_number = (db.scalar(select(func.max(RouteVersion.version_number)).where(RouteVersion.job_id == job.job_id)) or 0) + 1
         comparison = _comparison(
@@ -2302,12 +2498,33 @@ def run_optimization(
             ongoing_return_by_mt=ongoing_return_by_mt,
         )
         persisted_trips: list[RouteVersionTrip] = []
+        roads = parameters.get("restricted_roads", {}).get("roads", [])
+        restriction_events = []
+        active_frozen_trips = {(row.current_vehicle_id, row.current_trip_number) for row in frozen_rows if row.status != "DONE"}
+        for frozen_trip in frozen_trips:
+            if (frozen_trip.vehicle_id, frozen_trip.trip_number) not in active_frozen_trips or not roads:
+                continue
+            conflicts = geometry_conflicts(frozen_trip.route_geometry or [], roads)
+            if conflicts or frozen_trip.route_geometry_source not in {"GRAPHHOPPER_RESTRICTED", "GOOGLE_RESTRICTED_WAYPOINTS"}:
+                restriction_events.append({"event": "FROZEN_TRIP_RESTRICTION_REVIEW_REQUIRED",
+                    "vehicle_id": frozen_trip.vehicle_id, "trip_number": frozen_trip.trip_number,
+                    "restricted_road_ids": conflicts,
+                    "message": "Frozen/current work was preserved. Review this trip against current road restrictions."})
+        if restriction_events:
+            state_snapshot.audit_events = [*(state_snapshot.audit_events or []), *restriction_events]
         geometry_started = perf_counter()
         geometry_request_budget = int(parameters.get("route_geometry_google_request_budget", 500))
         geometry_time_limit = int(parameters.get("route_geometry_time_limit_seconds", 120))
         geometry_google_requests = 0
         geometry_cache_hits = 0
         for trip in result["trips"]:
+            if roads and _utc(trip["estimated_return_depot"]) > datetime.fromisoformat(parameters["restricted_roads"]["horizon_end"]):
+                raise RestrictedRoutingError("RESTRICTED_HORIZON_EXCEEDED", "Trip exceeds the 48-hour restricted-road planning horizon.")
+            if roads:
+                trip_costs[(trip["vehicle_id"], trip["trip_number"])]["restricted_roads"] = {
+                    "checksum": parameters["restricted_roads"]["checksum"], "verified": True,
+                    "road_ids": [road["restricted_road_id"] for road in roads],
+                }
             ordered_spbus = [
                 inputs["spbus"][stop["loading_order"]["spbu_id"]]
                 for stop in trip["stops"]
@@ -2323,8 +2540,11 @@ def run_optimization(
                     "route_geometry_time_limit_seconds": max(0, round(geometry_time_limit - (perf_counter() - geometry_started))),
                 },
             )
+            if roads:
+                trip_costs[(trip["vehicle_id"], trip["trip_number"])]["restricted_legs"] = geometry.get("restricted_legs", [])
             geometry_google_requests += int(geometry.get("google_request_count") or 0)
             geometry_cache_hits += int(geometry.get("cache_hit_count") or 0)
+            trip_costs[(trip["vehicle_id"], trip["trip_number"])]["trip_timing"] = trip.get("trip_timing", {})
             entity = RouteVersionTrip(
                 route_version_trip_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=trip["vehicle_id"], trip_number=trip["trip_number"], shipment_id=trip["shipment_id"],
                 vehicle_ready_at_depot=trip["vehicle_ready_at_depot"], queue_start=trip.get("queue_start"), loading_start=trip.get("loading_start"), loading_finish=trip.get("loading_finish"), gate_out=trip["gate_out"],
@@ -2495,7 +2715,7 @@ def run_optimization(
                 run.solver_status = "FAILED"
                 run.end_time = datetime.now(timezone.utc)
                 run.solve_duration_ms = round((perf_counter() - started) * 1000)
-                run.error_code = "PHASE7_OPTIMIZATION_FAILED"
+                run.error_code = exc.code if isinstance(exc, RestrictedRoutingError) else "PHASE7_OPTIMIZATION_FAILED"
                 run.error_message = str(exc)
                 run.solver_metadata = {
                     **(run.solver_metadata or {}),
@@ -2510,7 +2730,7 @@ def run_optimization(
         raise HTTPException(status_code=500, detail={"code": "PHASE7_OPTIMIZATION_FAILED", "message": str(exc)}) from exc
 
 
-def run_optimization_background(job_id: str, payload: dict, *, reroute: bool, actor: str = "local-user") -> None:
+def _run_optimization_session(job_id: str, payload: dict, *, reroute: bool, actor: str = "local-user") -> None:
     """Run an accepted optimization with an independent database session."""
     with SessionLocal() as db:
         try:
@@ -2528,6 +2748,13 @@ def run_optimization_background(job_id: str, payload: dict, *, reroute: bool, ac
                 job.error_message = message
                 db.commit()
             logger.exception("Phase 7 background optimization terminated for job %s", job_id)
+
+
+def run_optimization_background(job_id: str, payload: dict, *, reroute: bool, actor: str = "local-user") -> None:
+    # Never run native solver code in the API interpreter: it can retain the
+    # GIL even when FastAPI dispatches a background task to a thread.
+    from .phase7_worker import supervise_optimization
+    supervise_optimization(job_id, payload, reroute=reroute, actor=actor)
 
 
 def list_route_versions(db: Session, job_id: str) -> list[dict]:
@@ -2852,18 +3079,26 @@ def get_route_version(db: Session, job_id: str, version_id: str | None = None) -
     bay_by_trip = {row.route_version_trip_id: row for row in bays}
     trip_payload = []
     for trip in trips:
-        trip_payload.append({"route_version_trip_id": trip.route_version_trip_id, "vehicle_id": trip.vehicle_id, "registration": vehicles[trip.vehicle_id].vehicle_registration if trip.vehicle_id in vehicles else trip.vehicle_id, "trip_number": trip.trip_number, "shipment_id": trip.shipment_id, "vehicle_ready_at_depot": _iso(trip.vehicle_ready_at_depot), "queue_start": _iso(trip.queue_start), "loading_start": _iso(trip.loading_start), "loading_finish": _iso(trip.loading_finish), "gate_out": _iso(trip.gate_out), "return_depot": _iso(trip.estimated_return_depot), "distance_meters": trip.distance_meters, "travel_time_seconds": trip.driving_seconds, "service_seconds": trip.service_seconds, "queue_minutes": trip.queue_minutes, "loading_minutes": trip.loading_minutes, "operating_minutes": trip.operating_minutes, "assignment_status": trip.assignment_status, "route_geometry": trip.route_geometry, "route_geometry_source": trip.route_geometry_source, "cost_breakdown": trip.cost_breakdown or {}, "bay_assignment": {"master_bay_id": bay_by_trip[trip.route_version_trip_id].master_bay_id, "queue_minutes": bay_by_trip[trip.route_version_trip_id].queue_minutes} if trip.route_version_trip_id in bay_by_trip else None, "stops": [{"sequence": row.sequence_number, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "latitude": float(spbus[row.spbu_id].latitude) if row.spbu_id in spbus and spbus[row.spbu_id].latitude is not None else None, "longitude": float(spbus[row.spbu_id].longitude) if row.spbu_id in spbus and spbus[row.spbu_id].longitude is not None else None, "arrival_time": _iso(row.arrival_time), "departure_time": _iso(row.departure_time), "service_minutes": row.service_minutes, "distance_from_previous_meters": row.distance_from_previous_meters, "travel_from_previous_seconds": row.travel_from_previous_seconds, "loading_order_ids": row.loading_order_ids or [], "products": row.products or [], "product_names": [products[product_id].product_name if product_id in products else product_id for product_id in (row.products or []) if product_id], "volume_kl": row.volume_kl} for row in stops_by_trip[trip.route_version_trip_id]], "loading_orders": [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "compartment_id": row.compartment_id, "stop_sequence": row.stop_sequence, "eta": _iso(row.eta), "frozen": row.frozen, "status": row.assignment_status, "phase6_deviation": row.phase6_deviation} for row in assignments_by_trip[trip.route_version_trip_id]]})
+        trip_payload.append({"route_version_trip_id": trip.route_version_trip_id, "vehicle_id": trip.vehicle_id, "registration": vehicles[trip.vehicle_id].vehicle_registration if trip.vehicle_id in vehicles else trip.vehicle_id, "trip_number": trip.trip_number, "shipment_id": trip.shipment_id, "vehicle_ready_at_depot": _iso(trip.vehicle_ready_at_depot), "queue_start": _iso(trip.queue_start), "loading_start": _iso(trip.loading_start), "loading_finish": _iso(trip.loading_finish), "gate_out": _iso(trip.gate_out), "return_depot": _iso(trip.estimated_return_depot), "distance_meters": trip.distance_meters, "travel_time_seconds": trip.driving_seconds, "service_seconds": trip.service_seconds, "trip_timing": (trip.cost_breakdown or {}).get("trip_timing"), "queue_minutes": trip.queue_minutes, "loading_minutes": trip.loading_minutes, "operating_minutes": trip.operating_minutes, "assignment_status": trip.assignment_status, "route_geometry": trip.route_geometry, "route_geometry_source": trip.route_geometry_source, "cost_breakdown": trip.cost_breakdown or {}, "bay_assignment": {"master_bay_id": bay_by_trip[trip.route_version_trip_id].master_bay_id, "queue_minutes": bay_by_trip[trip.route_version_trip_id].queue_minutes} if trip.route_version_trip_id in bay_by_trip else None, "stops": [{"sequence": row.sequence_number, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "latitude": float(spbus[row.spbu_id].latitude) if row.spbu_id in spbus and spbus[row.spbu_id].latitude is not None else None, "longitude": float(spbus[row.spbu_id].longitude) if row.spbu_id in spbus and spbus[row.spbu_id].longitude is not None else None, "arrival_time": _iso(row.arrival_time), "departure_time": _iso(row.departure_time), "service_minutes": row.service_minutes, "distance_from_previous_meters": row.distance_from_previous_meters, "travel_from_previous_seconds": row.travel_from_previous_seconds, "loading_order_ids": row.loading_order_ids or [], "products": row.products or [], "product_names": [products[product_id].product_name if product_id in products else product_id for product_id in (row.products or []) if product_id], "volume_kl": row.volume_kl} for row in stops_by_trip[trip.route_version_trip_id]], "loading_orders": [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "compartment_id": row.compartment_id, "stop_sequence": row.stop_sequence, "eta": _iso(row.eta), "frozen": row.frozen, "status": row.assignment_status, "phase6_deviation": row.phase6_deviation} for row in assignments_by_trip[trip.route_version_trip_id]]})
     dropped = [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "reason_code": row.dropped_reason_code, "reason_description": row.dropped_reason_description, "route_version": version.version_label} for row in assignments if row.assignment_status == "DROPPED"]
     snapshot = db.get(OperationalStateSnapshot, version.state_snapshot_id)
     parameters = db.get(OptimizationParameterSnapshot, version.parameter_snapshot_id)
     optimization_run = db.scalar(select(OptimizationRun).where(OptimizationRun.route_version_id == version.route_version_id))
     first_loading_start = min((trip.loading_start for trip in trips if trip.loading_start), default=None)
+    saved_roads = (parameters.effective_parameters if parameters else {}).get("restricted_roads", {})
+    road_reference = (optimization_run.optimization_reference_time or optimization_run.start_time) if optimization_run else _job_day(job, db.get(MasterDepot, job.depot_id))[0]
+    current_roads = restriction_snapshot(db, job.depot_id, road_reference)
+    restriction_status = {
+        "snapshot": saved_roads,
+        "changed_since_optimization": saved_roads.get("checksum", hashlib.sha256(b"[]").hexdigest()) != current_roads["checksum"],
+        "frozen_trip_warnings": [event for event in (snapshot.audit_events or []) if event.get("event") == "FROZEN_TRIP_RESTRICTION_REVIEW_REQUIRED"] if snapshot else [],
+    }
     depot_operation_span_minutes = (
         round((version.last_gate_out - first_loading_start).total_seconds() / 60)
         if first_loading_start and version.last_gate_out
         else version.depot_dispatch_span_minutes
     )
-    return {"route_version_id": version.route_version_id, "version_number": version.version_number, "version_label": version.version_label, "created_at": _iso(version.created_at), "created_by": version.created_by, "reason": version.reason, "objective": version.objective, "solver_status": version.solver_status, "objective_value": version.objective_value, "optimization_reference_time": _iso(optimization_run.optimization_reference_time or optimization_run.start_time) if optimization_run else None, "first_loading_start": _iso(first_loading_start), "first_gate_out": _iso(version.first_gate_out), "last_gate_out": _iso(version.last_gate_out), "depot_dispatch_span_minutes": depot_operation_span_minutes, "summary": version.summary_snapshot, "cost": version.cost_snapshot, "comparison": version.comparison_snapshot, "audit_events": snapshot.audit_events if snapshot else [], "parameter_snapshot": parameters.effective_parameters if parameters else {}, "parameter_checksum": parameters.parameter_checksum if parameters else None, "trips": trip_payload, "dropped_lo": dropped}
+    return {"route_version_id": version.route_version_id, "version_number": version.version_number, "version_label": version.version_label, "created_at": _iso(version.created_at), "created_by": version.created_by, "reason": version.reason, "objective": version.objective, "solver_status": version.solver_status, "objective_value": version.objective_value, "optimization_reference_time": _iso(optimization_run.optimization_reference_time or optimization_run.start_time) if optimization_run else None, "first_loading_start": _iso(first_loading_start), "first_gate_out": _iso(version.first_gate_out), "last_gate_out": _iso(version.last_gate_out), "depot_dispatch_span_minutes": depot_operation_span_minutes, "summary": version.summary_snapshot, "cost": version.cost_snapshot, "comparison": version.comparison_snapshot, "audit_events": snapshot.audit_events if snapshot else [], "parameter_snapshot": parameters.effective_parameters if parameters else {}, "parameter_checksum": parameters.parameter_checksum if parameters else None, "restriction_status": restriction_status, "trips": trip_payload, "dropped_lo": dropped}
 
 
 def get_trip_details(db: Session, job_id: str, version_id: str, trip_id: str) -> dict:
@@ -2935,6 +3170,16 @@ def get_map_road_geometry(
     error_codes: set[str] = set()
     started = perf_counter()
     for trip in trips:
+        if trip["route_geometry_source"] in {"GRAPHHOPPER_RESTRICTED", "GOOGLE_RESTRICTED_WAYPOINTS"}:
+            # Preserve the exact matrix-selected road evidence of this version.
+            # Never hydrate it from a current Google/OSRM route or newer rules.
+            response_trips.append({"route_version_trip_id": trip["route_version_trip_id"],
+                "vehicle_id": trip["vehicle_id"], "trip_number": trip["trip_number"],
+                "route_geometry": trip["route_geometry"], "route_geometry_source": trip["route_geometry_source"],
+                "road_geometry": True, "cache_hit": True, "error_codes": []})
+            road_count += 1
+            cache_hits += 1
+            continue
         ordered_spbus = []
         for stop in sorted(trip["stops"], key=lambda row: int(row["sequence"])):
             spbu = db.get(MasterSPBU, stop["spbu_id"])

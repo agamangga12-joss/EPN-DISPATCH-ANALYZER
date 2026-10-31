@@ -66,6 +66,8 @@ from .models import (
     StgSPBU,
     TagAlias,
 )
+from .master_data import consolidate_master, refresh_historical_travel_times, rebuild_shipment_membership
+from .importer import ImportProcessor
 from .normalization import clean_str, file_sha256, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, source_time, split_project_tags
 from .pairing_intelligence import (
     build_pairing_date_availability,
@@ -79,6 +81,7 @@ from .phase5_behavioral import recover_interrupted_behavioral_training_runs
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
 from .phase7_routes import router as phase7_router
+from .restricted_road_routes import router as restricted_road_router
 from .phase8_routes import router as phase8_router
 from .phase9_routes import router as phase9_router
 from .phase10_auth import IntegrationAPIError
@@ -115,7 +118,13 @@ async def lifespan(_app: FastAPI):
             logger.warning("Recovered %s interrupted Phase 7 optimization job(s).", recovered)
     except Exception:
         logger.exception("Could not recover interrupted Phase 7 optimization runs during startup.")
-    yield
+    from .phase7_worker import initialize_optimization_processes
+    initialize_optimization_processes()
+    try:
+        yield
+    finally:
+        from .phase7_worker import shutdown_optimization_processes
+        shutdown_optimization_processes()
 
 
 app = FastAPI(title="Dispatch Intelligence Platform", version="0.1.0", lifespan=lifespan)
@@ -132,6 +141,7 @@ app.add_exception_handler(RequestValidationError, integration_validation_error_h
 app.include_router(phase5_router)
 app.include_router(phase6_router)
 app.include_router(phase7_router)
+app.include_router(restricted_road_router)
 app.include_router(phase8_router)
 app.include_router(phase9_router)
 app.include_router(phase10_router)
@@ -148,7 +158,7 @@ class CompatibilityRequest(BaseModel):
 def sync_spbu_coordinates_from_source(db: Session, rows: list[MasterSPBU]) -> int:
     updated = 0
     for spbu in rows:
-        if not spbu.source_coordinate:
+        if not spbu.source_coordinate or (spbu.latitude is not None and spbu.longitude is not None):
             continue
         latitude, longitude, messages = parse_coordinate(spbu.source_coordinate)
         if messages:
@@ -230,79 +240,18 @@ class SaveAffinityAnalysisConfigRequest(BaseModel):
 
 
 IMPORT_TEMPLATE_COLUMNS = {
-    "MOBIL_TANGKI": [
-        "depot_id",
-        "vehicle_registration",
-        "vehicle_name_raw",
-        "capacity_label",
-        "vehicle_type_tag",
-        "project_tag",
-        "number_of_compartments",
-        "active_status",
-    ],
-    "SPBU": [
-        "depot_id",
-        "spbu_code",
-        "spbu_name",
-        "address",
-        "city",
-        "source_coordinate",
-        "latitude",
-        "longitude",
-        "master_distance_km",
-        "master_travel_time_min",
-        "vehicle_type_tag",
-        "project_tag",
-        "official_window_start",
-        "official_window_end",
-        "active_status",
-    ],
-    "LOADING_ORDER": [
-        "depot_id",
-        "shipment_id",
-        "loading_order_number",
-        "source_depot_name",
-        "operating_date",
-        "vehicle_registration",
-        "vehicle_type_tag",
-        "project_tag",
-        "validation_date",
-        "validation_time",
-        "gate_out_date",
-        "gate_out_time",
-        "shipment_end_date",
-        "shipment_end_time",
-        "source_spbu_code",
-        "shipto",
-        "source_product_name",
-        "quantity",
-        "driver_name",
-        "driver_nip",
-        "assistant_name",
-        "assistant_nip",
-        "status",
-        "source_distance_km",
-        "actual_km",
-        "area_id",
-        "area",
-    ],
+    "MOBIL_TANGKI": ["vehicle_registration", "vehicle_type_tag", "project_tag", "number_of_compartments", "active_status"],
+    "SPBU": ["spbu_code", "address", "latitude", "longitude", "master_distance_km", "vehicle_type_tag", "project_tag", "official_window_start", "official_window_end", "active_status"],
+    "LOADING_ORDER": ["shipment_id", "loading_order_number", "vehicle_registration", "vehicle_type_tag", "project_tag", "validation_datetime", "gate_out_datetime", "shipment_end_datetime", "source_spbu_code", "source_product_name", "quantity", "driver_name", "driver_nip", "assistant_name", "assistant_nip", "actual_km"],
     "GPS": ["vehicle_registration", "event_datetime", "latitude", "longitude", "speed", "heading", "source_device_id"],
 }
-
 IMPORT_TEMPLATE_REQUIRED = {
-    "MOBIL_TANGKI": {"depot_id", "vehicle_registration"},
-    "SPBU": {"depot_id", "spbu_code"},
-    "LOADING_ORDER": {"depot_id", "shipment_id", "loading_order_number", "source_depot_name"},
+    "MOBIL_TANGKI": {"vehicle_registration"},
+    "SPBU": {"spbu_code"},
+    "LOADING_ORDER": {"shipment_id", "loading_order_number", "validation_datetime"},
     "GPS": {"vehicle_registration", "event_datetime"},
 }
-
-EXPORT_DOMAIN_LABELS = {
-    "MOBIL_TANGKI": "Mobil Tangki",
-    "SPBU": "SPBU",
-    "LOADING_ORDER": "Loading Orders",
-    "SHIPMENT": "Shipments",
-    "ALL": "All Data",
-}
+EXPORT_DOMAIN_LABELS = {"MOBIL_TANGKI": "Mobil Tangki", "SPBU": "SPBU", "LOADING_ORDER": "Historikal Shipment", "SHIPMENT": "Shipments", "ALL": "All Data"}
 
 
 @app.get("/api/v1/health")
@@ -311,7 +260,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/imports", status_code=202)
-def upload_import(domain: str, sheet_name: str, file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
+def upload_import(domain: str, sheet_name: str, file: UploadFile = File(...), depot_id: str | None = None, db: Session = Depends(get_db)) -> dict:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".xlsx", ".csv"}:
         raise HTTPException(status_code=400, detail="Only XLSX and CSV are supported in Phase 0.")
@@ -326,6 +275,10 @@ def upload_import(domain: str, sheet_name: str, file: UploadFile = File(...), db
     }.get(normalized_domain, "")
     if not normalized_domain:
         raise HTTPException(status_code=400, detail="Unknown import domain.")
+    if normalized_domain != "GPS" or depot_id:
+        depot = db.get(MasterDepot, depot_id) if depot_id else None
+        if not depot or depot.active_status != "ACTIVE":
+            raise HTTPException(status_code=400, detail="Pilih depot aktif di top bar sebelum upload.")
     original_filename = Path(file.filename or f"upload{suffix}").name
     import_id = make_id("imp", normalized_domain, original_filename, datetime.now().isoformat())
     settings.import_upload_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +297,8 @@ def upload_import(domain: str, sheet_name: str, file: UploadFile = File(...), db
             sheet_name=sheet_name,
             uploaded_by="local-user",
             status="QUEUED",
-            mapping_version="phase0.v2",
+            mapping_version="phase0.v3",
+            depot_id=depot_id,
             stored_path=str(stored_path),
             file_size_bytes=file_size,
         )
@@ -361,6 +315,7 @@ def import_audit_payload(audit: ImportAudit) -> dict:
     return {
         "import_id": audit.import_id,
         "domain": audit.domain,
+        "depot_id": audit.depot_id,
         "filename": audit.filename,
         "sheet_name": audit.sheet_name,
         "uploaded_at": audit.uploaded_at,
@@ -380,8 +335,11 @@ def import_audit_payload(audit: ImportAudit) -> dict:
 
 
 @app.get("/api/v1/imports")
-def list_imports(db: Session = Depends(get_db)) -> list[dict]:
-    audits = db.scalars(select(ImportAudit).order_by(desc(ImportAudit.uploaded_at)).limit(8)).all()
+def list_imports(depot_id: str | None = None, db: Session = Depends(get_db)) -> list[dict]:
+    statement = select(ImportAudit)
+    if depot_id:
+        statement = statement.where(ImportAudit.depot_id == depot_id)
+    audits = db.scalars(statement.order_by(desc(ImportAudit.uploaded_at)).limit(8)).all()
     return [import_audit_payload(audit) for audit in audits]
 
 
@@ -679,7 +637,9 @@ def crud_list_master(
 @app.post("/api/v1/master-crud/{domain}")
 def crud_create_master(domain: str, payload: dict = Body(...), db: Session = Depends(get_db)) -> dict:
     normalized_domain = normalize_crud_domain(domain)
+    payload = prepare_master_payload(db, normalized_domain, payload)
     record = build_crud_record(normalized_domain, payload)
+    consolidate_master(record)
     reactivated = reactivate_deleted_crud_record(db, normalized_domain, record)
     if reactivated:
         apply_crud_tag_links(db, normalized_domain, reactivated, payload)
@@ -709,7 +669,9 @@ def crud_update_master(domain: str, record_id: str, payload: dict = Body(...), d
     record = get_crud_record(db, normalized_domain, record_id)
     if not record:
         raise HTTPException(status_code=404, detail="Master data record not found.")
+    payload = prepare_master_payload(db, normalized_domain, payload, record)
     apply_crud_update(normalized_domain, record, payload)
+    consolidate_master(record)
     apply_crud_tag_links(db, normalized_domain, record, payload)
     return commit_crud(db, normalized_domain, record)
 
@@ -730,6 +692,9 @@ def crud_delete_master(domain: str, record_id: str, db: Session = Depends(get_db
         if used:
             raise HTTPException(status_code=409, detail="Tag type is still referenced by canonical tags.")
     db.delete(record)
+    if normalized_domain == "LOADING_ORDER":
+        rebuild_shipment_membership(db, [record.shipment_id])
+        refresh_historical_travel_times(db, record.depot_id)
     db.commit()
     return {"status": "DELETED", "delete_mode": "HARD", "record_id": record_id}
 
@@ -782,7 +747,7 @@ def compatibility_check(request: CompatibilityRequest, db: Session = Depends(get
     return evaluate_mt_spbu_compatibility(db, request.mt_id, request.spbu_id, request.product_id, settings.vehicle_compatibility_mode)
 
 
-@app.get("/api/v1/tag-consistency/analysis")
+@app.get("/api/v1/tag-consistency/analysis", response_model=None)
 def tag_consistency_analysis(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -798,9 +763,10 @@ def tag_consistency_analysis(
     sort_direction: str = "desc",
     limit: int = 25,
     offset: int = 0,
+    export_excel: bool = False,
     db: Session = Depends(get_db),
-) -> dict:
-    return build_tag_consistency_payload(
+) -> dict | StreamingResponse:
+    payload = build_tag_consistency_payload(
         db,
         start_date=parse_iso_date_filter(start_date, "start_date"),
         end_date=parse_iso_date_filter(end_date, "end_date"),
@@ -814,8 +780,22 @@ def tag_consistency_analysis(
         search=search,
         sort_column=sort_column,
         sort_direction=sort_direction,
-        limit=limit,
-        offset=offset,
+        limit=None if export_excel else limit,
+        offset=0 if export_excel else offset,
+    )
+    if not export_excel:
+        return payload
+    headers = ["Date", "Loading Order", "Vehicle Registration", "SPBU", "Depot", "Overall Status", "Vehicle Class Result", "Tag Match Result", "Issue / Reason"]
+    rows = [[
+        row["loading_order_date"], row["loading_order_number"], row["vehicle_registration"],
+        row["spbu_code"] or row["spbu_name"], row["depot"], row["overall_group"].replace("_", " "),
+        row["vehicle_class_result"].replace("_", " "),
+        f"{row['tag_match_result'].replace('_', ' ')} ({row['mismatch_count']})", row["primary_reason"],
+    ] for row in payload["rows"]]
+    scope = payload["effective_filters"]
+    filename = f"tag_consistency_{safe_filename(scope['depot_id'] or 'all_depots')}.xlsx"
+    return workbook_response(
+        [("Main Analysis Table", headers, rows)], filename, literal_text=True,
     )
 
 
@@ -1345,6 +1325,9 @@ def serialize_crud_record(
         data["crud_record_id"] = record.loading_order_id
         shipment = (lo_shipment_values or {}).get(record.shipment_id)
         data["vehicle_registration"] = shipment.vehicle_registration if shipment else None
+        data["gate_out_datetime"] = shipment.gate_out_datetime if shipment else None
+        data["vehicle_type_tag"] = shipment.vehicle_type_tag_observed if shipment else None
+        data["project_tag"] = shipment.project_tag_raw if shipment else None
         data["validation_datetime"] = shipment.validation_datetime if shipment else None
         data["validation_date"] = shipment.validation_datetime.date() if shipment and shipment.validation_datetime else None
         data["validation_time"] = shipment.validation_datetime.time().replace(microsecond=0) if shipment and shipment.validation_datetime else None
@@ -1411,6 +1394,11 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "primary_depot_id": MasterSPBU.primary_depot_id,
             "spbu_code": MasterSPBU.spbu_code,
             "city": MasterSPBU.city,
+            "address": MasterSPBU.address,
+            "master_distance_km": MasterSPBU.master_distance_km,
+            "master_rth_min": MasterSPBU.master_rth_min,
+            "master_travel_time_min": MasterSPBU.master_travel_time_min,
+            "master_travel_time_sample_count": MasterSPBU.master_travel_time_sample_count,
             "source_coordinate": MasterSPBU.source_coordinate,
             "tag_vehicle_class": MasterSPBU.vehicle_type_tag,
             "vehicle_type_tag": MasterSPBU.vehicle_type_tag,
@@ -1427,6 +1415,8 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "shipment_id": FactLoadingOrderLine.shipment_id,
             "vehicle_registration": FactShipment.vehicle_registration,
             "validation_datetime": FactShipment.validation_datetime,
+            "gate_out_datetime": FactShipment.gate_out_datetime,
+            "actual_km": FactLoadingOrderLine.actual_km,
             "validation_date": func.date(FactShipment.validation_datetime),
             "validation_time": cast(FactShipment.validation_datetime, Time),
             "driver_name": FactShipment.driver_name,
@@ -1605,6 +1595,74 @@ def apply_crud_filters(domain: str, stmt, count_stmt, search: str | None, search
     return stmt.where(*filters), count_stmt.where(*filters)
 
 
+def prepare_master_payload(db: Session, domain: str, payload: dict, record=None) -> dict:
+    payload = dict(payload)
+    if domain not in {"MOBIL_TANGKI", "SPBU", "LOADING_ORDER"}:
+        return payload
+    depot_field = "primary_depot_id" if domain == "SPBU" else "depot_id"
+    depot_id = clean_str(payload.get(depot_field)) or (getattr(record, depot_field, None) if record else None)
+    depot = db.get(MasterDepot, depot_id) if depot_id else None
+    if not depot or depot.active_status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Pilih depot aktif yang valid.")
+    if record and getattr(record, depot_field) != depot_id:
+        raise HTTPException(status_code=400, detail="Depot record tidak dapat dipindahkan melalui edit.")
+    payload[depot_field] = depot_id
+    if domain == "MOBIL_TANGKI":
+        if "vehicle_registration" in payload:
+            payload["vehicle_registration"] = normalize_key(payload["vehicle_registration"])
+        return payload
+    if domain == "SPBU":
+        payload.pop("master_travel_time_min", None)
+        return payload
+    payload["source_depot_name"] = depot.depot_name
+    shipment_id = clean_str(payload.get("shipment_id")) or (record.shipment_id if record else None)
+    if not shipment_id:
+        raise HTTPException(status_code=400, detail="shipment_id is required.")
+    if record and record.shipment_id != shipment_id:
+        raise HTTPException(status_code=400, detail="Shipment ID tidak dapat diubah melalui edit.")
+    shipment = db.get(FactShipment, shipment_id)
+    if shipment and shipment.depot_id != depot_id:
+        raise HTTPException(status_code=400, detail="Shipment ID sudah digunakan depot lain.")
+    if not shipment:
+        shipment = FactShipment(shipment_id=shipment_id, source_shipment_id=shipment_id, depot_id=depot_id)
+        db.add(shipment)
+    for field in ("validation_datetime", "gate_out_datetime", "shipment_end_datetime"):
+        if field in payload:
+            try:
+                value = ImportProcessor.shipment_datetime(payload, field, (), (), depot)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            setattr(shipment, field, value)
+    if shipment.validation_datetime:
+        from zoneinfo import ZoneInfo
+        value = shipment.validation_datetime
+        zone = ZoneInfo(depot.timezone or "Asia/Jakarta")
+        shipment.operating_date = (value.replace(tzinfo=zone) if value.tzinfo is None else value.astimezone(zone)).date()
+    for source, target in (("vehicle_type_tag", "vehicle_type_tag_observed"), ("project_tag", "project_tag_raw")):
+        if source in payload:
+            setattr(shipment, target, clean_str(payload[source]))
+    for field in ("driver_name", "driver_nip", "assistant_name", "assistant_nip"):
+        if field in payload:
+            setattr(shipment, field, clean_str(payload[field]))
+    if "vehicle_registration" in payload:
+        shipment.vehicle_registration = normalize_key(payload["vehicle_registration"])
+        mt = db.scalar(select(MasterMT).where(MasterMT.depot_id == depot_id, MasterMT.vehicle_registration == shipment.vehicle_registration, MasterMT.active_status != "DELETED"))
+        shipment.mt_id = mt.mt_id if mt else None
+        shipment.vehicle_mapping_status = "MATCHED" if mt else "UNMATCHED"
+    code = clean_str(payload.get("source_spbu_code")) or (record.source_spbu_code if record else None)
+    spbu = db.scalar(select(MasterSPBU).where(MasterSPBU.primary_depot_id == depot_id, MasterSPBU.spbu_code == code, MasterSPBU.active_status != "DELETED")) if code else None
+    payload.update(shipment_id=shipment_id, spbu_id=spbu.spbu_id if spbu else None, spbu_mapping_status="MATCHED" if spbu else "UNMATCHED")
+    if payload.get("source_product_name"):
+        product = ImportProcessor(db).resolve_product(payload["source_product_name"], "manual")
+        payload["product_id"] = product.product_id if product else None
+    if "actual_km" in payload:
+        payload["source_distance_km"] = payload["actual_km"]
+    for obsolete in ("status", "shipto", "area", "area_id"):
+        payload.pop(obsolete, None)
+    db.flush()
+    return payload
+
+
 def build_crud_record(domain: str, payload: dict):
     if domain == "DEPOT":
         depot_name = required_text(payload, "depot_name")
@@ -1634,7 +1692,7 @@ def build_crud_record(domain: str, payload: dict):
         tag_type_id = clean_str(payload.get("tag_type_id")) or make_id("tagtype", infer_tag_type(tag_value))
         return MasterTag(tag_id=make_id("tag", normalized), tag_type_id=tag_type_id, tag_value=tag_value, normalized_tag=normalized, active_status=clean_str(payload.get("active_status")) or "ACTIVE")
     if domain == "MOBIL_TANGKI":
-        raw_name = required_text(payload, "vehicle_name_raw")
+        raw_name = clean_str(payload.get("vehicle_name_raw")) or required_text(payload, "vehicle_registration")
         registration = clean_str(payload.get("vehicle_registration"))
         capacity = clean_str(payload.get("capacity_label"))
         if not registration:
@@ -1685,7 +1743,7 @@ def build_crud_record(domain: str, payload: dict):
             official_window_end=source_time(payload.get("official_window_end"), time(23, 59)),
         )
     if domain == "LOADING_ORDER":
-        source_depot_name = required_text(payload, "source_depot_name")
+        source_depot_name = clean_str(payload.get("source_depot_name")) or ""
         depot_id = required_text(payload, "depot_id")
         loading_order_number = required_text(payload, "loading_order_number")
         return FactLoadingOrderLine(
@@ -1970,6 +2028,10 @@ def required_text(payload: dict, field: str) -> str:
 
 
 def commit_crud(db: Session, domain: str, record) -> dict:
+    if domain == "LOADING_ORDER":
+        rebuild_shipment_membership(db, [record.shipment_id])
+    if domain in {"SPBU", "LOADING_ORDER"}:
+        refresh_historical_travel_times(db, record.primary_depot_id if domain == "SPBU" else record.depot_id)
     try:
         db.commit()
     except IntegrityError as exc:
@@ -1979,7 +2041,8 @@ def commit_crud(db: Session, domain: str, record) -> dict:
     tag_types = tag_type_lookup(db) if domain in {"MOBIL_TANGKI", "SPBU", "TAG"} else None
     mt_tag_values = mt_tag_value_lookup(db, [record.mt_id], tag_types or {}) if domain == "MOBIL_TANGKI" else None
     spbu_tag_values = spbu_tag_value_lookup(db, [record.spbu_id], tag_types or {}) if domain == "SPBU" else None
-    return {"status": "OK", "record": serialize_crud_record(domain, record, tag_types, mt_tag_values, spbu_tag_values)}
+    lo_values = loading_order_shipment_lookup(db, [record.shipment_id]) if domain == "LOADING_ORDER" else None
+    return {"status": "OK", "record": serialize_crud_record(domain, record, tag_types, mt_tag_values, spbu_tag_values, lo_values)}
 
 
 def normalize_export_domain(domain: str) -> str:
@@ -2022,6 +2085,7 @@ def workbook_response(
     filename: str,
     template_required: set[str] | None = None,
     depot_reference: list[MasterDepot] | None = None,
+    literal_text: bool = False,
 ) -> StreamingResponse:
     workbook = Workbook()
     default_sheet = workbook.active
@@ -2029,8 +2093,14 @@ def workbook_response(
     for sheet_index, (sheet_name, headers, rows) in enumerate(sheets):
         worksheet = workbook.create_sheet(title=sheet_name[:31])
         worksheet.append(headers)
-        for row in rows:
+        for row_index, row in enumerate(rows, start=2):
             worksheet.append([format_cell(value) for value in row])
+            if literal_text:
+                # Source identifiers and reasons must remain text, even if they start with '='.
+                for column_index in range(1, len(headers) + 1):
+                    cell = worksheet.cell(row_index, column_index)
+                    if isinstance(cell.value, str):
+                        cell.data_type = "s"
         for column_index, cell in enumerate(worksheet[1], start=1):
             required = bool(template_required and sheet_index == 0 and cell.value in template_required)
             cell.fill = PatternFill("solid", fgColor="C55A11" if required else "1F4E78")
@@ -2052,12 +2122,13 @@ def workbook_response(
         date_columns = {"operating_date", "validation_date", "gate_out_date", "shipment_end_date"}
         time_columns = {"official_window_start", "official_window_end", "validation_time", "gate_out_time", "shipment_end_time"}
         for header in sheets[0][1]:
-            column_format = "YYYY-MM-DD" if header in date_columns else "HH:MM:SS" if header in time_columns else "Text / number sesuai kolom"
+            column_format = "YYYY-MM-DD HH:MM:SS (timezone depot)" if header.endswith("_datetime") else "YYYY-MM-DD" if header in date_columns else "HH:MM:SS" if header in time_columns else "Text / number sesuai kolom"
             guide.append([header, "Wajib" if header in template_required else "Opsional", column_format])
         for cell in guide[1]:
             cell.fill = PatternFill("solid", fgColor="1F4E78")
             cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
             cell.alignment = Alignment(horizontal="center", vertical="center")
+        guide.append(["Depot", "Otomatis", "Mengikuti depot aktif di top bar saat upload"])
         guide.freeze_panes = "A2"
         guide.auto_filter.ref = f"A1:C{guide.max_row}"
         guide.column_dimensions["A"].width = 28
@@ -2153,214 +2224,52 @@ def build_tag_lookup(db: Session, owner: str, ids: list[str]) -> dict[str, str]:
 
 
 def build_mt_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
-    headers = [
-        "depot_id",
-        "depot_code",
-        "depot_name",
-        "source_mt_id",
-        "vehicle_name_raw",
-        "vehicle_registration",
-        "capacity_label",
-        "vehicle_type_tag",
-        "number_of_compartments",
-        "source_hub_id",
-        "assignee",
-        "active_status",
-        "project_tags",
-        "source_import_id",
-    ]
-    mts = db.scalars(select(MasterMT).where(MasterMT.depot_id == depot.depot_id).order_by(MasterMT.vehicle_registration)).all()
-    tag_lookup = build_tag_lookup(db, "MT", [mt.mt_id for mt in mts])
-    rows = [
-        [
-            depot.depot_id,
-            depot.depot_code,
-            depot.depot_name,
-            mt.source_mt_id,
-            mt.vehicle_name_raw,
-            mt.vehicle_registration,
-            mt.capacity_label,
-            mt.vehicle_type_tag,
-            mt.number_of_compartments,
-            mt.source_hub_id,
-            mt.assignee,
-            mt.active_status,
-            tag_lookup.get(mt.mt_id, ""),
-            mt.source_import_id,
-        ]
-        for mt in mts
-    ]
+    headers = IMPORT_TEMPLATE_COLUMNS["MOBIL_TANGKI"]
+    records = db.scalars(select(MasterMT).where(MasterMT.depot_id == depot.depot_id, MasterMT.active_status != "DELETED").order_by(MasterMT.vehicle_registration)).all()
+    rows = [[getattr(row, "project_tag_raw" if key == "project_tag" else key) for key in headers] for row in records]
     return "Mobil Tangki", headers, rows
 
 
 def build_spbu_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
-    headers = [
-        "depot_id",
-        "depot_code",
-        "depot_name",
-        "spbu_code",
-        "spbu_name",
-        "address",
-        "city",
-        "latitude",
-        "longitude",
-        "source_coordinate",
-        "master_distance_km",
-        "master_travel_time_min",
-        "vehicle_type_tag",
-        "official_window_start",
-        "official_window_end",
-        "active_status",
-        "project_tags",
-        "source_import_id",
-    ]
-    spbus = db.scalars(select(MasterSPBU).where(MasterSPBU.primary_depot_id == depot.depot_id).order_by(MasterSPBU.spbu_code)).all()
-    tag_lookup = build_tag_lookup(db, "SPBU", [spbu.spbu_id for spbu in spbus])
-    rows = [
-        [
-            depot.depot_id,
-            depot.depot_code,
-            depot.depot_name,
-            spbu.spbu_code,
-            spbu.spbu_name,
-            spbu.address,
-            spbu.city,
-            spbu.latitude,
-            spbu.longitude,
-            spbu.source_coordinate,
-            spbu.master_distance_km,
-            spbu.master_travel_time_min,
-            spbu.vehicle_type_tag,
-            spbu.official_window_start,
-            spbu.official_window_end,
-            spbu.active_status,
-            tag_lookup.get(spbu.spbu_id, ""),
-            spbu.source_import_id,
-        ]
-        for spbu in spbus
-    ]
+    headers = IMPORT_TEMPLATE_COLUMNS["SPBU"] + ["master_rth_min", "master_travel_time_min", "master_travel_time_sample_count"]
+    records = db.scalars(select(MasterSPBU).where(MasterSPBU.primary_depot_id == depot.depot_id, MasterSPBU.active_status != "DELETED").order_by(MasterSPBU.spbu_code)).all()
+    rows = [[getattr(row, "project_tag_raw" if key == "project_tag" else key) for key in headers] for row in records]
     return "SPBU", headers, rows
 
 
+def local_shipment_value(shipment, field: str, depot: MasterDepot):
+    from zoneinfo import ZoneInfo
+    value = getattr(shipment, field, None)
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(ZoneInfo(depot.timezone or "Asia/Jakarta"))
+    return value
+
+
 def build_shipment_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
-    headers = [
-        "depot_id",
-        "depot_code",
-        "depot_name",
-        "source_shipment_id",
-        "operating_date",
-        "area_id",
-        "area",
-        "vehicle_registration",
-        "vehicle_mapping_status",
-        "vehicle_type_tag_observed",
-        "validation_datetime",
-        "gate_out_datetime",
-        "shipment_end_datetime",
-        "driver_name",
-        "driver_nip",
-        "assistant_name",
-        "assistant_nip",
-        "status",
-        "source_import_id",
-    ]
+    headers = ["shipment_id", "vehicle_registration", "validation_datetime", "gate_out_datetime", "shipment_end_datetime", "driver_name", "driver_nip", "assistant_name", "assistant_nip"]
     shipments = db.scalars(select(FactShipment).where(FactShipment.depot_id == depot.depot_id).order_by(FactShipment.source_shipment_id)).all()
-    rows = [
-        [
-            depot.depot_id,
-            depot.depot_code,
-            depot.depot_name,
-            shipment.source_shipment_id,
-            shipment.operating_date,
-            shipment.area_id,
-            shipment.area,
-            shipment.vehicle_registration,
-            shipment.vehicle_mapping_status,
-            shipment.vehicle_type_tag_observed,
-            shipment.validation_datetime,
-            shipment.gate_out_datetime,
-            shipment.shipment_end_datetime,
-            shipment.driver_name,
-            shipment.driver_nip,
-            shipment.assistant_name,
-            shipment.assistant_nip,
-            shipment.status,
-            shipment.source_import_id,
-        ]
-        for shipment in shipments
-    ]
+    rows = [[local_shipment_value(row, field, depot) for field in headers] for row in shipments]
     return "Shipments", headers, rows
 
 
 def build_loading_order_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
-    headers = [
-        "depot_id",
-        "depot_code",
-        "depot_name",
-        "source_depot_name",
-        "source_shipment_id",
-        "loading_order_number",
-        "source_spbu_code",
-        "spbu_code",
-        "spbu_mapping_status",
-        "shipto",
-        "product_name",
-        "source_product_name",
-        "quantity",
-        "driver_name",
-        "driver_nip",
-        "assistant_name",
-        "assistant_nip",
-        "shipment_end_date",
-        "shipment_end_time",
-        "status",
-        "source_distance_km",
-        "actual_km",
-        "source_import_id",
-    ]
-    rows_query = (
-        select(FactLoadingOrderLine, FactShipment)
-        .join(FactShipment, FactShipment.shipment_id == FactLoadingOrderLine.shipment_id)
-        .where(FactShipment.depot_id == depot.depot_id)
-        .order_by(FactShipment.source_shipment_id, FactLoadingOrderLine.loading_order_number)
-    )
-    line_pairs = db.execute(rows_query).all()
-    spbu_ids = {line.spbu_id for line, _ in line_pairs if line.spbu_id}
-    product_ids = {line.product_id for line, _ in line_pairs if line.product_id}
-    spbus = {spbu.spbu_id: spbu for spbu in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()} if spbu_ids else {}
-    products = {product.product_id: product for product in db.scalars(select(MasterProduct).where(MasterProduct.product_id.in_(product_ids))).all()} if product_ids else {}
+    headers = IMPORT_TEMPLATE_COLUMNS["LOADING_ORDER"]
+    pairs = db.execute(select(FactLoadingOrderLine, FactShipment).join(FactShipment, FactShipment.shipment_id == FactLoadingOrderLine.shipment_id).where(FactShipment.depot_id == depot.depot_id, active_loading_order_filter()).order_by(FactShipment.shipment_id, FactLoadingOrderLine.loading_order_number)).all()
     rows = []
-    for line, shipment in line_pairs:
-        spbu = spbus.get(line.spbu_id)
-        product = products.get(line.product_id)
-        rows.append(
-            [
-                depot.depot_id,
-                depot.depot_code,
-                depot.depot_name,
-                line.source_depot_name,
-                shipment.source_shipment_id,
-                line.loading_order_number,
-                line.source_spbu_code,
-                spbu.spbu_code if spbu else "",
-                line.spbu_mapping_status,
-                line.shipto,
-                product.product_name if product else "",
-                line.source_product_name,
-                line.quantity,
-                shipment.driver_name,
-                shipment.driver_nip,
-                shipment.assistant_name,
-                shipment.assistant_nip,
-                shipment.shipment_end_datetime.date() if shipment.shipment_end_datetime else None,
-                shipment.shipment_end_datetime.time().replace(microsecond=0) if shipment.shipment_end_datetime else None,
-                line.status,
-                line.source_distance_km,
-                line.actual_km,
-                line.source_import_id,
-            ]
-        )
-    return "Loading Orders", headers, rows
+    for line, shipment in pairs:
+        row = []
+        for key in headers:
+            if key == "project_tag":
+                value = shipment.project_tag_raw
+            elif key == "vehicle_type_tag":
+                value = shipment.vehicle_type_tag_observed
+            elif hasattr(line, key):
+                value = getattr(line, key)
+            else:
+                value = local_shipment_value(shipment, key, depot)
+            row.append(value)
+        rows.append(row)
+    return "Historikal Shipment", headers, rows
 
 
 def public(model) -> dict:

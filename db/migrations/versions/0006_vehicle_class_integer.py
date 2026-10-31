@@ -23,7 +23,7 @@ def upgrade() -> None:
         type_=sa.Integer(),
         postgresql_using="""
             CASE
-                WHEN vehicle_type_tag ~ '^[0-9]+(\\.0+)?$'
+                WHEN vehicle_type_tag::text ~ '^[0-9]+(\\.0+)?$'
                     THEN vehicle_type_tag::numeric::integer
                 ELSE NULL
             END
@@ -36,7 +36,7 @@ def upgrade() -> None:
         type_=sa.Integer(),
         postgresql_using="""
             CASE
-                WHEN vehicle_type_tag ~ '^[0-9]+(\\.0+)?$'
+                WHEN vehicle_type_tag::text ~ '^[0-9]+(\\.0+)?$'
                     THEN vehicle_type_tag::numeric::integer
                 ELSE NULL
             END

@@ -12,4 +12,5 @@ coverage/
 ml_artifacts/
 import_uploads/
 outputs/
+routing-data/
 example data/~$*.xlsx

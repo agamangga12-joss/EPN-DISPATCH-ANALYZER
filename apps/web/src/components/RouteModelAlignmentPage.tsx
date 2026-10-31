@@ -322,7 +322,7 @@ function EvidenceBlock({ title, payload }: { title: string; payload: Record<stri
 
 
 export function RouteModelAlignmentPage({ depots }: { depots: Depot[] }) {
-  const [depotId, setDepotId] = useState("");
+  const [depotId, setDepotId] = useState(depots[0]?.depot_id || "");
   const [routes, setRoutes] = useState<RouteOption[]>([]);
   const [routeVersionId, setRouteVersionId] = useState("");
   const [routesLoading, setRoutesLoading] = useState(false);
