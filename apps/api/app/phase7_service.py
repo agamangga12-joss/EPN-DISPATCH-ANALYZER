@@ -1747,8 +1747,24 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
         })
     actual = db.scalars(select(ActualBayState).where(ActualBayState.job_id == job.job_id)).all()
     queue = db.scalars(select(OptimizationInitialQueue).where(OptimizationInitialQueue.job_id == job.job_id)).all()
+    spbu_reservations = []
+    if job.current_route_version_id and ongoing_trip_keys:
+        for trip in db.scalars(select(RouteVersionTrip).where(RouteVersionTrip.route_version_id == job.current_route_version_id)).all():
+            if (trip.vehicle_id, int(trip.trip_number)) not in ongoing_trip_keys:
+                continue
+            active_ids = {row.loading_order_id for row in rows if row.current_vehicle_id == trip.vehicle_id and row.current_trip_number == trip.trip_number and row.status != "DONE"}
+            visit_meta = {item["sequence"]: item for item in ((trip.cost_breakdown or {}).get("trip_timing") or {}).get("spbu_visits", [])}
+            for stop in db.scalars(select(RouteVersionStop).where(RouteVersionStop.route_version_trip_id == trip.route_version_trip_id)).all():
+                if not stop.spbu_id or not stop.arrival_time or not stop.departure_time or not (set(stop.loading_order_ids or []) & active_ids):
+                    continue
+                meta = visit_meta.get(stop.sequence_number)
+                start = _utc(trip.gate_out) + timedelta(seconds=meta["unloading_start_offset_seconds"]) if meta else _utc(stop.arrival_time)
+                end = _utc(stop.departure_time)
+                if end > _utc(current_time):
+                    spbu_reservations.append({"spbu_id": stop.spbu_id, "start_seconds": round((start-day_start).total_seconds()), "end_seconds": round((end-day_start).total_seconds()), "source_trip_id": trip.route_version_trip_id})
     return {
         "depot": depot,
+        "spbu_reservations": spbu_reservations,
         "day_start": day_start,
         "operational_start": operational_start,
         "operational_end": operational_end,
@@ -1833,7 +1849,7 @@ def _cost_breakdown(result: dict, vehicles: list[dict], parameters: dict) -> dic
     distance = sum(trip["distance_meters"] for trip in result["trips"]) / 1000 * float(parameters["cost_per_km"])
     operating_hours = sum(trip["operating_minutes"] for trip in result["trips"]) / 60
     operating = operating_hours * float(parameters["cost_per_operating_hour"])
-    queue = sum(int(trip.get("queue_minutes") or 0) for trip in result["trips"]) * float(parameters["queue_cost"])
+    queue = sum(int(trip.get("queue_minutes") or 0) + float(trip.get("spbu_queue_seconds",0))/60 for trip in result["trips"]) * float(parameters["queue_cost"])
     loading = sum(int(trip.get("loading_minutes") or 0) for trip in result["trips"]) * float(parameters["loading_cost"])
     overtime_minutes = sum(max(0, int(trip["operating_minutes"]) - int(vehicle_map[trip["vehicle_id"]]["working_time_remaining_minutes"])) for trip in result["trips"])
     overtime = overtime_minutes * float(parameters["overtime_cost"])
@@ -1873,7 +1889,7 @@ def _trip_cost_breakdowns(result: dict, vehicles: list[dict], parameters: dict) 
             activated.add(trip["vehicle_id"])
         distance = trip["distance_meters"] / 1000 * float(parameters["cost_per_km"])
         operating = trip["operating_minutes"] / 60 * float(parameters["cost_per_operating_hour"])
-        queue = int(trip.get("queue_minutes") or 0) * float(parameters["queue_cost"])
+        queue = (int(trip.get("queue_minutes") or 0) + float(trip.get("spbu_queue_seconds",0))/60) * float(parameters["queue_cost"])
         loading = int(trip.get("loading_minutes") or 0) * float(parameters["loading_cost"])
         overtime_minutes = max(0, int(trip["operating_minutes"]) - int(vehicle["working_time_remaining_minutes"]))
         overtime = overtime_minutes * float(parameters["overtime_cost"])
@@ -2118,6 +2134,7 @@ def _summary(result: dict, all_rows: list[LOOperationalState], frozen_trips: lis
         "average_queue_minutes": round(sum(queue_minutes) / len(queue_minutes), 2) if queue_minutes else 0,
         "maximum_queue_minutes": max(queue_minutes, default=0),
         "total_distance_meters": total_distance,
+        "spbu_queue_minutes": round((sum(float(trip.get("spbu_queue_seconds",0)) for trip in trips)+sum(float(((trip.cost_breakdown or {}).get("trip_timing") or {}).get("spbu_queue_seconds",0)) for trip in frozen_trips))/60,2),
         "total_travel_time_seconds": sum(int(trip["driving_seconds"]) for trip in trips) + sum(trip.driving_seconds for trip in frozen_trips),
         "total_operating_minutes": total_operating,
         "average_trip_duration_minutes": round(total_operating / all_trips_count, 2) if all_trips_count else 0,
@@ -2360,6 +2377,8 @@ def run_optimization(
     optimization_run = None
     try:
         inputs = _solver_inputs(db, job, parameters, current_time=current_time, reroute=reroute)
+        parameters["_spbu_reservations"] = inputs.get("spbu_reservations", [])
+        parameters.pop("_spbu_first_stop_penalties", None)
         state_snapshot = _state_snapshot(
             db,
             job,
@@ -2558,7 +2577,7 @@ def run_optimization(
             lo_by_id = {row["loading_order_id"]: row for row in trip["lo_assignments"]}
             for stop in trip["stops"]:
                 stop_los = stop.get("loading_orders") or [stop["loading_order"]]
-                db.add(RouteVersionStop(route_version_stop_id=uuid.uuid4().hex, route_version_trip_id=entity.route_version_trip_id, sequence_number=stop["sequence"], stop_type="SPBU", spbu_id=stop["loading_order"]["spbu_id"], arrival_time=stop["arrival"] + (_utc(trip["gate_out"]) - _utc(trip["preliminary_gate_out"])), departure_time=stop["departure"] + (_utc(trip["gate_out"]) - _utc(trip["preliminary_gate_out"])), service_minutes=round((stop["departure"] - stop["arrival"]).total_seconds() / 60), distance_from_previous_meters=stop["leg_distance_meters"], travel_from_previous_seconds=stop["leg_seconds"], loading_order_ids=[lo["loading_order_id"] for lo in stop_los], products=sorted({lo.get("product_id") for lo in stop_los if lo.get("product_id")}), volume_kl=sum(float(lo["volume_kl"]) for lo in stop_los)))
+                db.add(RouteVersionStop(route_version_stop_id=uuid.uuid4().hex, route_version_trip_id=entity.route_version_trip_id, sequence_number=stop["sequence"], stop_type="SPBU", spbu_id=stop["loading_order"]["spbu_id"], arrival_time=stop["arrival"] + (_utc(trip["gate_out"]) - _utc(trip["preliminary_gate_out"])), departure_time=stop["departure"] + (_utc(trip["gate_out"]) - _utc(trip["preliminary_gate_out"])), service_minutes=round((stop["departure"] - stop.get("unloading_start", stop["arrival"])).total_seconds() / 60), distance_from_previous_meters=stop["leg_distance_meters"], travel_from_previous_seconds=stop["leg_seconds"], loading_order_ids=[lo["loading_order_id"] for lo in stop_los], products=sorted({lo.get("product_id") for lo in stop_los if lo.get("product_id")}), volume_kl=sum(float(lo["volume_kl"]) for lo in stop_los)))
                 for lo in stop_los:
                     assignment = lo_by_id[lo["loading_order_id"]]
                     phase6_deviation = {"vehicle_changed": bool(lo.get("phase6_predicted_vehicle_id") and lo["phase6_predicted_vehicle_id"] != trip["vehicle_id"]), "shipment_changed": bool(lo.get("phase6_predicted_shipment_id") and lo["phase6_predicted_shipment_id"] != trip["shipment_id"])}
@@ -3056,6 +3075,13 @@ def get_lo_comparison(db: Session, job_id: str, source_a: str, source_b: str) ->
     }
 
 
+def _spbu_stop_metadata(trip, sequence):
+    meta = next((item for item in ((trip.cost_breakdown or {}).get("trip_timing") or {}).get("spbu_visits", []) if item["sequence"] == sequence), None)
+    if not meta:
+        return {"spbu_queue_seconds": 0, "unloading_start_time": None}
+    return {"spbu_queue_seconds": meta["queue_seconds"], "unloading_start_time": _iso(_utc(trip.gate_out)+timedelta(seconds=meta["unloading_start_offset_seconds"]))}
+
+
 def get_route_version(db: Session, job_id: str, version_id: str | None = None) -> dict:
     job = _require_job(db, job_id)
     version = _require_version(db, job, version_id)
@@ -3079,7 +3105,7 @@ def get_route_version(db: Session, job_id: str, version_id: str | None = None) -
     bay_by_trip = {row.route_version_trip_id: row for row in bays}
     trip_payload = []
     for trip in trips:
-        trip_payload.append({"route_version_trip_id": trip.route_version_trip_id, "vehicle_id": trip.vehicle_id, "registration": vehicles[trip.vehicle_id].vehicle_registration if trip.vehicle_id in vehicles else trip.vehicle_id, "trip_number": trip.trip_number, "shipment_id": trip.shipment_id, "vehicle_ready_at_depot": _iso(trip.vehicle_ready_at_depot), "queue_start": _iso(trip.queue_start), "loading_start": _iso(trip.loading_start), "loading_finish": _iso(trip.loading_finish), "gate_out": _iso(trip.gate_out), "return_depot": _iso(trip.estimated_return_depot), "distance_meters": trip.distance_meters, "travel_time_seconds": trip.driving_seconds, "service_seconds": trip.service_seconds, "trip_timing": (trip.cost_breakdown or {}).get("trip_timing"), "queue_minutes": trip.queue_minutes, "loading_minutes": trip.loading_minutes, "operating_minutes": trip.operating_minutes, "assignment_status": trip.assignment_status, "route_geometry": trip.route_geometry, "route_geometry_source": trip.route_geometry_source, "cost_breakdown": trip.cost_breakdown or {}, "bay_assignment": {"master_bay_id": bay_by_trip[trip.route_version_trip_id].master_bay_id, "queue_minutes": bay_by_trip[trip.route_version_trip_id].queue_minutes} if trip.route_version_trip_id in bay_by_trip else None, "stops": [{"sequence": row.sequence_number, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "latitude": float(spbus[row.spbu_id].latitude) if row.spbu_id in spbus and spbus[row.spbu_id].latitude is not None else None, "longitude": float(spbus[row.spbu_id].longitude) if row.spbu_id in spbus and spbus[row.spbu_id].longitude is not None else None, "arrival_time": _iso(row.arrival_time), "departure_time": _iso(row.departure_time), "service_minutes": row.service_minutes, "distance_from_previous_meters": row.distance_from_previous_meters, "travel_from_previous_seconds": row.travel_from_previous_seconds, "loading_order_ids": row.loading_order_ids or [], "products": row.products or [], "product_names": [products[product_id].product_name if product_id in products else product_id for product_id in (row.products or []) if product_id], "volume_kl": row.volume_kl} for row in stops_by_trip[trip.route_version_trip_id]], "loading_orders": [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "compartment_id": row.compartment_id, "stop_sequence": row.stop_sequence, "eta": _iso(row.eta), "frozen": row.frozen, "status": row.assignment_status, "phase6_deviation": row.phase6_deviation} for row in assignments_by_trip[trip.route_version_trip_id]]})
+        trip_payload.append({"route_version_trip_id": trip.route_version_trip_id, "vehicle_id": trip.vehicle_id, "registration": vehicles[trip.vehicle_id].vehicle_registration if trip.vehicle_id in vehicles else trip.vehicle_id, "trip_number": trip.trip_number, "shipment_id": trip.shipment_id, "vehicle_ready_at_depot": _iso(trip.vehicle_ready_at_depot), "queue_start": _iso(trip.queue_start), "loading_start": _iso(trip.loading_start), "loading_finish": _iso(trip.loading_finish), "gate_out": _iso(trip.gate_out), "return_depot": _iso(trip.estimated_return_depot), "distance_meters": trip.distance_meters, "travel_time_seconds": trip.driving_seconds, "service_seconds": trip.service_seconds, "trip_timing": (trip.cost_breakdown or {}).get("trip_timing"), "queue_minutes": trip.queue_minutes, "loading_minutes": trip.loading_minutes, "operating_minutes": trip.operating_minutes, "assignment_status": trip.assignment_status, "route_geometry": trip.route_geometry, "route_geometry_source": trip.route_geometry_source, "cost_breakdown": trip.cost_breakdown or {}, "bay_assignment": {"master_bay_id": bay_by_trip[trip.route_version_trip_id].master_bay_id, "queue_minutes": bay_by_trip[trip.route_version_trip_id].queue_minutes} if trip.route_version_trip_id in bay_by_trip else None, "stops": [{**_spbu_stop_metadata(trip, row.sequence_number), "sequence": row.sequence_number, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "latitude": float(spbus[row.spbu_id].latitude) if row.spbu_id in spbus and spbus[row.spbu_id].latitude is not None else None, "longitude": float(spbus[row.spbu_id].longitude) if row.spbu_id in spbus and spbus[row.spbu_id].longitude is not None else None, "arrival_time": _iso(row.arrival_time), "departure_time": _iso(row.departure_time), "service_minutes": row.service_minutes, "distance_from_previous_meters": row.distance_from_previous_meters, "travel_from_previous_seconds": row.travel_from_previous_seconds, "loading_order_ids": row.loading_order_ids or [], "products": row.products or [], "product_names": [products[product_id].product_name if product_id in products else product_id for product_id in (row.products or []) if product_id], "volume_kl": row.volume_kl} for row in stops_by_trip[trip.route_version_trip_id]], "loading_orders": [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "compartment_id": row.compartment_id, "stop_sequence": row.stop_sequence, "eta": _iso(row.eta), "frozen": row.frozen, "status": row.assignment_status, "phase6_deviation": row.phase6_deviation} for row in assignments_by_trip[trip.route_version_trip_id]]})
     dropped = [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "reason_code": row.dropped_reason_code, "reason_description": row.dropped_reason_description, "route_version": version.version_label} for row in assignments if row.assignment_status == "DROPPED"]
     snapshot = db.get(OperationalStateSnapshot, version.state_snapshot_id)
     parameters = db.get(OptimizationParameterSnapshot, version.parameter_snapshot_id)

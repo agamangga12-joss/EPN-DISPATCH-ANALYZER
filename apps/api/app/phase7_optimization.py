@@ -317,7 +317,9 @@ class VRPOptimizationService:
         def minute_callback(from_index: int, to_index: int) -> int:
             source = manager.IndexToNode(from_index)
             target = manager.IndexToNode(to_index)
-            return math.ceil(time_matrix[source][target] / 60) + (service_minutes if source else (int(parameters.get("refueling_minutes", 0)) if target else 0))
+            same_stop = source and target and remaining[source-1]["spbu_id"] == remaining[target-1]["spbu_id"]
+            service = 0 if same_stop else (service_minutes if source else (int(parameters.get("refueling_minutes", 0)) if target else 0))
+            return math.ceil(time_matrix[source][target] / 60) + service
 
         minute_index = routing.RegisterTransitCallback(minute_callback)
         # Depot operating hours govern loading/gate-out, not the vehicle's
@@ -376,6 +378,24 @@ class VRPOptimizationService:
         )
         capacity_dimension = routing.GetDimensionOrDie("Capacity")
 
+        if service_minutes and constraint_is_hard(parameters, "spbu_no_overlap"):
+            cp = routing.solver()
+            groups = defaultdict(list)
+            for node, order in enumerate(remaining, start=1):
+                groups[str(order["spbu_id"])].append(manager.NodeToIndex(node))
+            for indexes in groups.values():
+                for offset, left in enumerate(indexes):
+                    for right in indexes[offset+1:]:
+                        before = cp.IsGreaterOrEqualVar(time_dimension.CumulVar(right), time_dimension.CumulVar(left)+service_minutes)
+                        after = cp.IsGreaterOrEqualVar(time_dimension.CumulVar(left), time_dimension.CumulVar(right)+service_minutes)
+                        different_mt = cp.IsDifferentVar(routing.VehicleVar(left), routing.VehicleVar(right))
+                        cp.Add(before+after >= routing.ActiveVar(left)+routing.ActiveVar(right)+different_mt-2)
+            for reservation in parameters.get("_spbu_reservations", []):
+                for index in groups.get(str(reservation["spbu_id"]), []):
+                    before = cp.IsLessOrEqualCstVar(time_dimension.CumulVar(index), math.floor(reservation["start_seconds"]/60)-service_minutes)
+                    after = cp.IsGreaterOrEqualCstVar(time_dimension.CumulVar(index), math.ceil(reservation["end_seconds"]/60))
+                    cp.Add(before+after >= routing.ActiveVar(index))
+
         objective = parameters["objective"]
         use_elapsed_cost = bool(parameters.get("refueling_minutes", 0) or parameters.get("driving_break_minutes", 0))
         for vehicle_index, vehicle in enumerate(vehicles):
@@ -393,6 +413,8 @@ class VRPOptimizationService:
                     )
                 if target:
                     target_lo = remaining[target - 1]
+                    if not source:
+                        base += int((parameters.get("_spbu_first_stop_penalties") or {}).get(str(target_lo["spbu_id"]), 0))
                     vehicle_id = vehicles[vehicle_index]["mt_id"]
                     for constraint_id in (target_lo.get("constraint_violations_by_vehicle") or {}).get(vehicle_id, []):
                         base += constraint_penalty(parameters, constraint_id)
@@ -830,6 +852,7 @@ class VRPOptimizationService:
                     "trip_number": trip_number,
                     "shipment_id": f"P7-SHIP-{vehicle['mt_id']}-{trip_number:02d}",
                     "vehicle_ready_at_depot": ready,
+                    "physical_vehicle_ready_at_depot": max(_utc(vehicle.get("optimization_reference_time") or day_start), _utc(vehicle.get("availability_eta_depot") or vehicle["effective_eta_depot"]) if constraint_is_hard(parameters,"vehicle_availability") else _utc(day_start), _utc(vehicle.get("depot_operational_start") or day_start) if constraint_is_hard(parameters,"depot_operating_window") else _utc(day_start)),
                     "preliminary_gate_out": ready,
                     "gate_out": ready,
                     "estimated_return_depot": preliminary_return,
@@ -1709,6 +1732,13 @@ class OptimizationCoordinatorService:
         deadline: float,
     ) -> tuple[dict, int, bool]:
         """Schedule every retained/retried trip together so bay intervals remain global."""
+        if constraint_rule(parameters,"spbu_no_overlap").get("enabled",True):
+            # Routing may delay departure to avoid a station conflict. That is
+            # not a later physical depot arrival. Let the joint bay/SPBU model
+            # choose between loading earlier + station queue or departing later.
+            for trip in trips:
+                if trip.get("physical_vehicle_ready_at_depot") is not None:
+                    trip["vehicle_ready_at_depot"] = trip["physical_vehicle_ready_at_depot"]
         previous_gateouts: list[datetime] = []
         time_limit_reached = False
         iterations = 0
@@ -1791,6 +1821,10 @@ class OptimizationCoordinatorService:
             if result["solver_status"] in {"TIMEOUT", "UNKNOWN", "FAILED", "INFEASIBLE"}:
                 time_limit_reached = result["solver_status"] == "TIMEOUT"
                 break
+        if constraint_rule(parameters, "spbu_no_overlap").get("enabled", True):
+            from .phase7_spbu import schedule_spbu
+            result = schedule_spbu(trips, result, bays, parameters, day_start, depot_close, deadline)
+            time_limit_reached = time_limit_reached or result.get("spbu_status") == "TIMEOUT"
         return result, iterations, time_limit_reached
 
     @staticmethod
@@ -1809,6 +1843,7 @@ class OptimizationCoordinatorService:
             for index, reason in (bay_result.get("dropped_trip_reasons") or {}).items()
         }
         reason_descriptions = {
+            "SPBU_CONGESTION": "No coordinated loading/unloading schedule satisfies SPBU capacity, receiving windows and physical MT availability within the available search budget.",
             "BAY_PRODUCT_CONSTRAINT": "No eligible loading bay satisfies the active hard product, loading-duration, or bay-stability constraints.",
             "BAY_CONGESTION": "The bay scheduler omitted this otherwise eligible trip because available bay capacity/time was insufficient relative to the Serve Loading Order penalty.",
             "BAY_WINDOW_EXHAUSTED": "Every compatible FIFO bay would gate this trip out after the active bay or depot operating window.",
@@ -1823,7 +1858,7 @@ class OptimizationCoordinatorService:
         retryable_failures: set[int] = {
             index
             for index, reason_code in bay_drop_reason_codes.items()
-            if reason_code in {"BAY_WINDOW_EXHAUSTED", "BAY_CONGESTION", "BAY_PRODUCT_CONSTRAINT"}
+            if reason_code in {"BAY_WINDOW_EXHAUSTED", "BAY_CONGESTION", "BAY_PRODUCT_CONSTRAINT", "SPBU_CONGESTION"}
         }
         tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
         working_limit = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
@@ -1938,7 +1973,66 @@ class OptimizationCoordinatorService:
             [[time_matrix[source][target] for target in indexes] for source in indexes],
         )
 
-    def optimize(
+    @staticmethod
+    def _coordinated_score(result, vehicles, parameters):
+        activation = set()
+        cost = sum(constraint_penalty(parameters, "serve_loading_order") for _ in result.get("dropped", []))
+        for trip in result.get("trips", []):
+            penalty = sum(float(row.get("penalty", 0)) for row in trip.get("constraint_violations", []))
+            if parameters["objective"] == "MIN_TOTAL_DISTANCE":
+                cost += trip.get("distance_meters",0) + penalty
+            elif parameters["objective"] == "MIN_TOTAL_OPERATING_TIME":
+                cost += trip["operating_minutes"]*1000 + penalty
+            else:
+                cost += trip.get("distance_meters",0)/1000*float(parameters["cost_per_km"]) + trip["operating_minutes"]/60*float(parameters["cost_per_operating_hour"])
+                cost += (int(trip.get("queue_minutes",0))+float(trip.get("spbu_queue_seconds",0))/60)*float(parameters.get("queue_cost",0)) + int(trip.get("loading_minutes",0))*float(parameters.get("loading_cost",0)) + penalty
+                source = next(v for v in vehicles if v["mt_id"] == trip["vehicle_id"])
+                cost += max(0,trip["operating_minutes"]-int(source.get("working_time_remaining_minutes",trip["operating_minutes"])))*float(parameters.get("overtime_cost",0))
+                if trip["vehicle_id"] not in activation:
+                    vehicle = next(v for v in vehicles if v["mt_id"] == trip["vehicle_id"])
+                    cost += VRPOptimizationService._vehicle_cost(parameters, vehicle)
+                    activation.add(trip["vehicle_id"])
+        return cost
+
+    def optimize(self, **kwargs):
+        parameters = kwargs["parameters"]
+        started = perf_counter()
+        # Existing route + repair and bay budgets form one shared coordination
+        # deadline. Alternative route searches never receive unbounded budgets.
+        budget = 2*int(parameters.get("route_optimization_time_limit",30)) + int(parameters.get("bay_optimization_time_limit",30))
+        best = self._optimize_once(**kwargs)
+        if not constraint_rule(parameters,"spbu_no_overlap").get("enabled",True):
+            return best
+        audit = [{"iteration":1,"score":self._coordinated_score(best,kwargs["vehicles"],parameters),"status":best["solver_status"]}]
+        best_score = audit[0]["score"]
+        visits = defaultdict(int)
+        for trip in best.get("trips",[]):
+            for stop in trip.get("stops",[]): visits[str(stop["loading_order"]["spbu_id"])]+=1
+        demand_counts = defaultdict(int)
+        for order in kwargs["loading_orders"]:
+            if order.get("spbu_id"): demand_counts[str(order["spbu_id"])]+=1
+        congested = {key:max(count,visits.get(key,0)) for key,count in demand_counts.items() if max(count,visits.get(key,0))>1}
+        for iteration in range(2,int(parameters.get("spbu_route_search_iterations",2))+1):
+            remaining = budget-(perf_counter()-started)
+            if not congested or remaining<3: break
+            # Feedback changes which SPBU is attractive as the first stop. It
+            # guides Routing search only; candidates are compared using the real
+            # objective after bay + SPBU scheduling, excluding these hints.
+            unit = max(1,int(sum(t["distance_meters"] for t in best.get("trips",[]))/max(1,len(visits))))
+            hints = {key:unit*count*(iteration-1) for key,count in congested.items()}
+            candidate_parameters = {**parameters,"_spbu_first_stop_penalties":hints,
+                "route_optimization_time_limit":max(1,min(int(parameters.get("route_optimization_time_limit",30)),int(remaining/3))),
+                "bay_optimization_time_limit":max(1,min(int(parameters.get("bay_optimization_time_limit",30)),int(remaining/3)))}
+            candidate = self._optimize_once(**{**kwargs,"parameters":candidate_parameters})
+            score = self._coordinated_score(candidate,kwargs["vehicles"],parameters)
+            valid = candidate["solver_status"] in {"FEASIBLE","OPTIMAL","PARTIAL"}
+            accepted = valid and (best["solver_status"] not in {"FEASIBLE","OPTIMAL","PARTIAL"} or score<best_score)
+            audit.append({"iteration":iteration,"score":score,"status":candidate["solver_status"],"accepted":accepted,"first_stop_penalties":hints})
+            if accepted: best,best_score=candidate,score
+        best["solver_metadata"] = {**best.get("solver_metadata",{}),"spbu_route_candidates":audit,"spbu_coordinated_score":best_score,"spbu_route_search_ms":round((perf_counter()-started)*1000)}
+        return best
+
+    def _optimize_once(
         self,
         *,
         loading_orders: list[dict],
@@ -2354,6 +2448,9 @@ class OptimizationCoordinatorService:
             "solver_metadata": {
                 **vrp_result["solver_metadata"],
                 "bay_engine": bay_result["engine"],
+                "spbu_engine": bay_result.get("spbu_engine"),
+                "spbu_solver_status": bay_result.get("spbu_status"),
+                "spbu_queue_seconds": sum(int(trip.get("spbu_queue_seconds",0)) for trip in trips),
                 "bay_scheduler_strategy": str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED"),
                 "bay_scheduler_metadata": bay_result.get("scheduler_metadata") or {},
                 "bay_solver_status": bay_result["solver_status"],

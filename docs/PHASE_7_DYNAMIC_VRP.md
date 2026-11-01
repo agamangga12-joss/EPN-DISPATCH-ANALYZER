@@ -465,3 +465,30 @@ Timeout dicatat sebagai PHASE7_PROCESS_TIMEOUT; crash sebelum hasil terminal dic
 Mekanisme ini adalah proses anak yang diawasi API, bukan antrean durable terpisah. Ketika API direstart, proses aktif dihentikan dan startup recovery menandai job yang terputus sebagai FAILED untuk dicoba ulang oleh operator. Gunakan satu instance/proses API seperti konfigurasi Docker bawaan; startup recovery saat ini belum mendukung beberapa instance API yang aktif bersamaan.
 
 Model break menggunakan slack pada dimensi waktu yang sudah ada, sehingga tidak membuat ulang constraint waktu dan transit untuk setiap pasangan node. Aturan 4 jam mengemudi dan reset per trip tidak berubah. Tidak diperlukan paket baru atau perubahan installer.
+
+
+## SPBU No Overlap: routing, loading bay, dan bongkar terkoordinasi
+
+Constraint `spbu_no_overlap` muncul pada tabel constraint profile dengan default **enabled / HARD**, kapasitas satu MT bongkar per canonical SPBU. Mode SOFT membolehkan overlap dengan penalty per pasangan kunjungan; DISABLED mempertahankan perhitungan tanpa penjadwalan resource SPBU. Nilai `queue_cost` digunakan untuk biaya antre per menit, baik antre bay maupun antre bongkar.
+
+Alur optimasi:
+
+1. OR-Tools Routing memasukkan disjunction waktu pelayanan untuk LO menuju SPBU yang sama pada MT berbeda, sekaligus mempertimbangkan receiving window, kompatibilitas, kapasitas, refueling, break dan waktu kerja. LO berurutan pada SPBU yang sama dalam satu MT dihitung sebagai satu kunjungan pelayanan. Constraint ini dapat mengubah urutan rute dan pembagian LO antar-MT sebelum jadwal final terbentuk.
+2. Scheduler bay yang dipilih (FIFO_BALANCED atau CP_SAT) menentukan bay dan jadwal awal. OR-Tools CP-SAT kemudian mengoordinasikan waktu loading pada bay terpilih, gate-out, tiba/mulai/selesai bongkar, kembali depot, dan kesiapan trip berikutnya secara bersama. Loading dapat digeser untuk menghindari antrean SPBU; jika bay harus selesai lebih awal, MT dapat berangkat lalu mengantre di SPBU.
+3. Trip yang tidak layak setelah koordinasi dikembalikan ke pencarian MT/rute alternatif pada mekanisme repair. Bay dan SPBU seluruh trip dievaluasi ulang bersama, termasuk trip hasil repair.
+4. Feedback kepadatan SPBU digunakan untuk mencari kandidat rute tambahan. Kandidat dinilai kembali berdasarkan objective sesungguhnya setelah koordinasi, termasuk waktu kerja, antrean dan penalty. Biaya panduan pencarian first-stop tidak ikut dimasukkan dalam skor akhir. `spbu_route_search_iterations` (UI **SPBU Route Search Candidates**) membatasi jumlah kandidat, default 2, rentang 1–5.
+
+Pencarian awal, repair dan alternatif berbagi batas total `2 × Route Time Limit + Bay Time Limit`, dengan supervisor proses yang sudah ada untuk menangani pemodelan/native solver yang melewati batas. Tidak ada jaminan optimum global: pemilihan rute, bay awal, repair dan feedback merupakan pencarian bertahap yang dibatasi waktu. CP-SAT mengoptimasi waktu pada bay dan urutan rute kandidat yang sedang diuji, bukan satu model global bebas untuk semua kombinasi bay/rute sekaligus.
+
+Aturan waktu:
+
+- ETA Tiba adalah waktu fisik tiba di SPBU. Mulai Bongkar dapat lebih lambat karena antrean atau receiving window. ETD = mulai bongkar + durasi pelayanan SPBU.
+- Receiving window berlaku pada waktu **mulai bongkar**; pelayanan boleh selesai setelah akhir window, sesuai kebijakan awal yang membatasi awal pelayanan. Tidak ada interval pelayanan yang bertumpuk saat mode HARD.
+- Waktu antre menambah waktu kerja dan biaya, menggeser tujuan berikutnya, return depot, serta loading/gate-out trip selanjutnya. Waktu antre tidak menambah atau mereset akumulasi mengemudi untuk break.
+- Perhitungan meliputi semua trip pada Job yang dioptimasi. Kunjungan belum selesai dari trip ONGOING versi current menjadi reservasi tetap berdasarkan jadwal tersimpan. Kunjungan yang LO-nya sudah DONE tidak menahan resource lagi. Tidak ada klaim mengetahui antrean kendaraan eksternal/Job lain tanpa data tambahan.
+- Reservasi dibuat server dari snapshot trip, bukan diterima sebagai override dari operator/profile. Jadwal ONGOING dan versi lama tetap dipertahankan. Reservasi lama yang bertumpuk digabung sebagai periode sibuk agar jadwal baru menghindarinya tanpa mencoba mengubah perjalanan yang sudah berjalan.
+- Jika CP-SAT tidak menghasilkan solusi yang dapat diverifikasi dalam budget, engine tidak menerbitkan jadwal HARD yang overlap. Status timeout/LO unserved dan alasan `SPBU_CONGESTION` dicatat; ini bukan bukti tidak ada solusi dengan waktu pencarian lebih panjang.
+
+Antrean dan offset mulai bongkar disimpan dalam JSON `trip_timing.spbu_visits`, diekspos sebagai `spbu_queue_seconds` dan `unloading_start_time` di stop Route Details. Durasi pelayanan tersimpan hanya mencakup bongkar, tidak mencampur antrean. Gantt menampilkan **Antre SPBU** terpisah dari perjalanan dan pelayanan. Rute lama tanpa metadata baru tetap dapat dibaca.
+
+Tidak ada migrasi database, service Docker, atau paket tambahan. Profile lama mendapat default constraint baru ketika dinormalisasi; gunakan Re-Optimize untuk menghasilkan versi rute yang mempertimbangkannya. Installer yang ada tetap membangun source terbaru secara otomatis.

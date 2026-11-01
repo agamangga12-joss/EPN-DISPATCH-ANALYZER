@@ -175,3 +175,14 @@ def test_freeze_window_release_validates_batch_scope_and_job_state(plan):
     assert client.post("/api/v1/phase7/jobs/J2/loading-orders/release-freeze-window",json={"loading_order_ids":["L1"]}).status_code == 404
     job=db.get(OptimizationJob,"J");job.status="CALCULATING";db.commit()
     assert client.post("/api/v1/phase7/jobs/J/loading-orders/release-freeze-window",json={"loading_order_ids":["L1"]}).status_code == 409
+
+
+def test_ongoing_unloading_reservations_are_server_owned_and_done_trips_do_not_block(plan):
+    db,_=plan
+    job=db.get(OptimizationJob,"J")
+    state=_solver_inputs(db,job,effective_parameters({}),current_time=NOW,reroute=True)
+    assert state["spbu_reservations"]==[{"spbu_id":"S","start_seconds":round((NOW+timedelta(hours=1)-state["day_start"]).total_seconds()),"end_seconds":round((NOW+timedelta(hours=1,minutes=30)-state["day_start"]).total_seconds()),"source_trip_id":"T1"}]
+    for row in db.scalars(select(LOOperationalState)).all():row.status="DONE"
+    db.flush()
+    state=_solver_inputs(db,job,effective_parameters({}),current_time=NOW,reroute=True)
+    assert state["spbu_reservations"]==[]

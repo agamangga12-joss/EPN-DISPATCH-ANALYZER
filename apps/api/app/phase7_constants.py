@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 
-PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v9"
+PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v10"
 
 JOB_STATUSES = {"DRAFT", "READY", "CALCULATING", "COMPLETED", "ACTIVE", "CLOSED", "FAILED"}
 LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
@@ -23,6 +23,7 @@ DROPPED_REASON_CODES = {
     "BAY_WINDOW_EXHAUSTED",
     "POST_BAY_REASSIGNMENT_TIMEOUT",
     "NO_FEASIBLE_ROUTE",
+    "SPBU_CONGESTION",
     "RESTRICTED_ROAD_NO_ROUTE",
     "RESTRICTED_ROUTE_REVIEW_REQUIRED",
     "USER_CANCELLED",
@@ -81,7 +82,7 @@ CONSTRAINT_DEFINITIONS: dict[str, dict] = {
     "spbu_time_window": {
         "label": "SPBU Receiving Window",
         "category": "TIME",
-        "description": "Arrival must be within the official SPBU receiving window.",
+        "description": "Unloading/service begins within the official SPBU receiving window; early arrivals may wait.",
         "default_mode": "HARD",
         "default_penalty": 250_000.0,
         "legacy_penalty": "late_penalty",
@@ -128,6 +129,13 @@ CONSTRAINT_DEFINITIONS: dict[str, dict] = {
         "label": "Bay No Overlap",
         "category": "BAY",
         "description": "One bay cannot load overlapping trips.",
+        "default_mode": "HARD",
+        "default_penalty": 1_000_000.0,
+    },
+    "spbu_no_overlap": {
+        "label": "SPBU No Overlap",
+        "category": "TIME",
+        "description": "One MT unloads at each SPBU at a time; coordinated route, bay and unloading scheduling includes queue time.",
         "default_mode": "HARD",
         "default_penalty": 1_000_000.0,
     },
@@ -279,6 +287,7 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "departure_time_tolerance_minutes": 5,
     "return_time_tolerance_minutes": 5,
     "maximum_trips_per_mt": 6,
+    "spbu_route_search_iterations": 2,
     "mt_turnaround_buffer_minutes": 30,
     "travel_time_mode": "AUTO",
     "average_speed_kmh": 35.0,
@@ -411,6 +420,7 @@ def effective_parameters(overrides: dict | None = None) -> dict:
         raise ValueError("average_speed_kmh must be between 1 and 150")
     parameters["average_speed_kmh"] = speed
     integer_bounds = {
+        "spbu_route_search_iterations": (1, 5),
         "refueling_minutes": (0, 1440),
         "driving_break_interval_minutes": (1, 1440),
         "driving_break_minutes": (0, 1440),
