@@ -1182,6 +1182,38 @@ def test_route_cache_uses_generic_drive_profile_across_vehicles() -> None:
         assert metrics["google_routes_cache_hit_count"] == 4
 
 
+def test_geometry_refresh_retries_cached_google_failure() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        fake = FakeRoutesClient()
+        service = Phase6RouteEstimationService(
+            session, configuration=get_google_routes_configuration(session), model_id="M1", google_client=fake,
+        )
+        arguments = {
+            "depot": session.get(MasterDepot, "D1"),
+            "spbus": [session.get(MasterSPBU, "A")],
+            "mt": session.get(MasterMT, "T1"),
+            "predicted_departure_datetime": datetime(2099, 1, 1, 1, tzinfo=timezone.utc),
+            "max_exact_sequence_stops": 4,
+        }
+        class FailingClient:
+            def compute_route(self, **kwargs):
+                raise GoogleRoutesError("GOOGLE_RATE_LIMIT", "Quota exceeded")
+
+        service.client = FailingClient()
+        first = service.estimate_trip(**arguments)
+        assert first["fallback_used"]
+        assert service.geometry_error_codes == {"GOOGLE_RATE_LIMIT"}
+        session.flush()
+        service.client = fake
+        refreshed = service.estimate_trip(**arguments, require_road_geometry=True)
+        assert refreshed["route_geometry_source"] == "GOOGLE_ROUTES_GEOJSON"
+        assert fake.calls == 2
+        service.estimate_trip(**arguments, require_road_geometry=True)
+        assert fake.calls == 2
+
+
 def test_route_cache_reuses_pending_rows_before_session_flush() -> None:
     Session = make_session()
     with Session() as session:

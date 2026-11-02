@@ -219,6 +219,7 @@ type RouteGeometryRefresh = {
   geographic_routes: GeographicRoutes;
   refreshed_trip_count: number;
   road_geometry_trip_count: number;
+  geometry_error_codes?: string[];
 };
 type PredictionResult = {
   id: string;
@@ -574,7 +575,7 @@ function GeographicMTRouteMap({ payload, runId }: { payload: GeographicRoutes; r
       });
       setRouteFeedback(response.road_geometry_trip_count > 0
         ? { status: "SUCCESS", message: `${response.road_geometry_trip_count} trip memakai geometri jalan Google Routes.` }
-        : { status: "WARNING", message: "Google Routes tidak menghasilkan geometri jalan. Garis fallback ditampilkan putus-putus." });
+        : { status: "WARNING", message: `Google Routes tidak menghasilkan geometri jalan. Penyebab: ${response.geometry_error_codes?.length ? response.geometry_error_codes.join(", ") : response.geometry_error_codes === undefined ? "Backend belum mengirim diagnostik; restart atau rebuild API ke versi terbaru" : "Geometri lengkap seluruh ruas trip belum tersedia"}. Garis fallback ditampilkan putus-putus.` });
     } catch (reason) {
       setRouteFeedback({ status: "ERROR", message: reason instanceof Error ? reason.message : "Geometri jalan gagal dimuat." });
     } finally {

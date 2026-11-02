@@ -1464,6 +1464,9 @@ def refresh_prediction_route_geometry(db: Session, run_id: str, vehicle_id: str)
             if line.spbu_id in spbus
         ]
         if not shipment_spbus or not trip.predicted_departure_datetime:
+            routing.geometry_error_codes.add(
+                "ROUTE_STOPS_MISSING" if not shipment_spbus else "ROUTE_DEPARTURE_MISSING"
+            )
             continue
         estimate = routing.estimate_trip(
             depot=depot,
@@ -1490,6 +1493,7 @@ def refresh_prediction_route_geometry(db: Session, run_id: str, vehicle_id: str)
         "geographic_routes": payload["geographic_routes"],
         "refreshed_trip_count": refreshed_trip_count,
         "road_geometry_trip_count": road_geometry_trip_count,
+        "geometry_error_codes": sorted(routing.geometry_error_codes),
     }
 
 

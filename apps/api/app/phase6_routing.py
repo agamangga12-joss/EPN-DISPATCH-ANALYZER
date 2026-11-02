@@ -71,6 +71,7 @@ class Phase6RouteEstimationService:
         # SessionLocal disables autoflush. Track cache rows added by this
         # prediction transaction so repeated legs reuse them before final flush.
         self._pending_cache: dict[str, RouteEstimationCache] = {}
+        self.geometry_error_codes: set[str] = set()
         self.client = google_client
         if self.client is None and configuration.encrypted_api_key:
             try:
@@ -129,7 +130,7 @@ class Phase6RouteEstimationService:
         geometry_source = metadata.get("route_geometry_source")
         if require_road_geometry and self.client and (
             geometry_source != "GOOGLE_ROUTES_GEOJSON" or len(geometry) < 2
-        ) and not metadata.get("road_geometry_attempted"):
+        ):
             self.metrics["google_routes_cache_miss_count"] += 1
             return None
         if not geometry:
@@ -346,6 +347,8 @@ class Phase6RouteEstimationService:
                     routing_mode="DRIVE",
                     routing_preference=self.configuration.routing_preference,
                 )
+                if len(response.get("route_geometry") or []) < 2:
+                    self.geometry_error_codes.add("GOOGLE_ROUTE_GEOMETRY_EMPTY")
                 warnings = list(mode["warning_codes"])
                 if response["restrictions_partially_ignored"]:
                     warnings.append("ROUTE_RESTRICTIONS_PARTIALLY_IGNORED")
@@ -357,8 +360,11 @@ class Phase6RouteEstimationService:
                     "road_geometry_attempted": True,
                     "warning_codes": sorted(set(warnings)),
                 }
-            except GoogleRoutesError:
+            except GoogleRoutesError as exc:
                 self.metrics["google_routes_failed_request_count"] += 1
+                self.geometry_error_codes.add(exc.code)
+        elif require_road_geometry:
+            self.geometry_error_codes.add("ROUTE_COORDINATES_MISSING" if not origin or not destination else "GOOGLE_ROUTES_KEY_UNAVAILABLE")
         if estimate is None:
             estimate = self._historical_fallback(origin_entity, destination_entity, origin, destination)
             estimate["road_geometry_attempted"] = road_geometry_attempted
