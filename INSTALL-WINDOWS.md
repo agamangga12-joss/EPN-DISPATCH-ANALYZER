@@ -59,10 +59,13 @@ upload/model yang dibutuhkan secara terpisah. Pertahankan kunci enkripsi `.env`
 jika memulihkan database yang berisi Google API key terenkripsi.
 
 Untuk distribusi instalasi baru, gunakan `.env.example` dan jangan sertakan `.env`
-pribadi. Installer akan membuat konfigurasi baru. Login pgAdmin menggunakan email
-PGADMIN_DEFAULT_EMAIL dan password PGADMIN_DEFAULT_PASSWORD di `.env`; password
-tidak ditampilkan installer. Perubahan `.env` tidak mereset akun pgAdmin yang sudah
-tersimpan dalam volume lama.
+pribadi. Installer akan membuat konfigurasi baru. pgAdmin memakai desktop mode:
+buka http://localhost:5051 langsung tanpa login atau master password. Akses port
+pgAdmin dibatasi ke komputer lokal (127.0.0.1). PGADMIN_DEFAULT_EMAIL dan
+PGADMIN_DEFAULT_PASSWORD di `.env` tetap diperlukan untuk inisialisasi container.
+Koneksi database memakai password file yang disiapkan otomatis.
+Untuk menerapkan perubahan pada instalasi lama, jalankan
+`docker compose up -d --force-recreate pgadmin`.
 
 ## Menghentikan / memeriksa
 

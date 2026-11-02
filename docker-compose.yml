@@ -23,6 +23,9 @@ services:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?Set PGADMIN_DEFAULT_PASSWORD in .env}
       PGADMIN_DISABLE_POSTFIX: "1"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_DESKTOP_USER: "'${PGADMIN_DEFAULT_EMAIL:-admin@example.com}'"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
       PGADMIN_SERVER_JSON_FILE: /tmp/dispatch-servers.json
       PGPASS_FILE: /tmp/dispatch.pgpass
       APP_DB_NAME: ${POSTGRES_DB:-dispatch_intelligence}

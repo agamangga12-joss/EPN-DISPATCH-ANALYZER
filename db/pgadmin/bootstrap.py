@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 
 
@@ -16,7 +17,7 @@ def prepare() -> None:
         "Port": 5432,
         "MaintenanceDB": database,
         "Username": username,
-        "ConnectionParameters": {"sslmode": "prefer", "passfile": ".pgpass"},
+        "ConnectionParameters": {"sslmode": "prefer", "passfile": os.environ["PGPASS_FILE"]},
     }
     Path(os.environ["PGADMIN_SERVER_JSON_FILE"]).write_text(
         json.dumps({"Servers": {"1": server}}), encoding="utf-8"
@@ -31,6 +32,23 @@ def prepare() -> None:
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(":".join(escaped) + "\n")
     passfile.chmod(0o600)
+
+    # Imported server definitions are retained in existing pgAdmin volumes.
+    # Update only this application's connection, preserving other servers.
+    config_db = Path("/var/lib/pgadmin/pgadmin4.db")
+    if config_db.exists():
+        with sqlite3.connect(config_db) as connection:
+            rows = connection.execute(
+                "SELECT id, connection_params FROM server WHERE name = ? AND host = ?",
+                (server["Name"], server["Host"]),
+            ).fetchall()
+            for server_id, raw_parameters in rows:
+                parameters = json.loads(raw_parameters or "{}")
+                parameters["passfile"] = str(passfile)
+                connection.execute(
+                    "UPDATE server SET connection_params = ? WHERE id = ?",
+                    (json.dumps(parameters), server_id),
+                )
 
 
 if __name__ == "__main__":
