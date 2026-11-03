@@ -32,7 +32,7 @@ def workbook_bytes(sheets: list[tuple[str, list[str], list[list]]]) -> bytes:
 
 def loading_order_template() -> bytes:
     return workbook_bytes(
-        [("Loading Order", ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl"], [["LO000001", "2026-08-22 05:00:00", "SPBU001", "PERTAMAX", 8]])]
+        [("Loading Order", ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl", "shift"], [["LO000001", "2026-08-22 05:00:00", "SPBU001", "PERTAMAX", 8, ""]])]
     )
 
 
@@ -41,7 +41,7 @@ def loading_order_workbook(rows: list[dict]) -> bytes:
         [
             (
                 "Loading Order",
-                ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl"],
+                ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl", "shift"],
                 [
                     [
                         row.get("loading_order_no"),
@@ -49,6 +49,7 @@ def loading_order_workbook(rows: list[dict]) -> bytes:
                         row.get("spbu_no"),
                         row.get("product"),
                         row.get("order_quantity_kl"),
+                        row.get("shift"),
                     ]
                     for row in rows
                 ],

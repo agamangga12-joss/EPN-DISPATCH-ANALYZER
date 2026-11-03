@@ -343,7 +343,7 @@ def test_managed_loading_order_workbook_api_returns_excel_file() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     sheet = load_workbook(BytesIO(response.content), read_only=True, data_only=True).active
-    assert list(sheet.iter_rows(min_row=2, values_only=True)) == [("LO-API-1", "2026-08-22 09:00:00", "SPBU-A", "PERTAMAX", 8)]
+    assert list(sheet.iter_rows(min_row=2, values_only=True)) == [("LO-API-1", "2026-08-22 09:00:00", "SPBU-A", "PERTAMAX", 8, None)]
 
 
 def test_managed_mt_availability_workbook_api_returns_excel_file() -> None:

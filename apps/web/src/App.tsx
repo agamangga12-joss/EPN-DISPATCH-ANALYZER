@@ -1,3 +1,4 @@
+import OperationalShiftEditor from "./components/OperationalShiftEditor";
 import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Database, Download, Eye, FileUp, GitBranch, MapPinned, Menu, Pencil, Plus, RefreshCw, Route, Save, Search, Trash2, UserCircle, X } from "lucide-react";
 import ReactECharts from "echarts-for-react";
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -77,7 +78,7 @@ type CrudResponse = {
 type CrudField = {
   key: string;
   label: string;
-  kind?: "text" | "number" | "select" | "textarea" | "checkbox" | "time";
+  kind?: "text" | "number" | "select" | "textarea" | "checkbox" | "time" | "shifts";
   required?: boolean;
   defaultValue?: string | number | boolean;
   readonlyOnEdit?: boolean;
@@ -677,6 +678,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         { key: "longitude", label: "Longitude", kind: "number" },
         { key: "region", label: "Region" },
         { key: "timezone", label: "Timezone" },
+        { key: "operational_shifts", label: "Operational Shifts", kind: "shifts" },
         { key: "depot_operational_start", label: "Operational Start", kind: "time", required: true, defaultValue: "00:00" },
         { key: "depot_operational_end", label: "Operational End", kind: "time", required: true, defaultValue: "23:59" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
@@ -4637,6 +4639,7 @@ function DepotWorkspace({ activeDepotId, onDepotChange }: { activeDepotId: strin
                         {activeCrudConfig.fields.map((field) => {
                           const fieldValue = formRow.values[field.key] ?? "";
                           const fieldDisabled = Boolean(crudModalMode === "edit" && field.readonlyOnEdit);
+                          if (field.kind === "shifts") return <OperationalShiftEditor key={field.key} value={fieldValue} onChange={(value) => updateCrudBatchValue(rowIndex, field.key, value)} />;
                           if (field.kind === "checkbox") {
                             return (
                               <label key={field.key} className="flex items-center gap-2 text-sm">

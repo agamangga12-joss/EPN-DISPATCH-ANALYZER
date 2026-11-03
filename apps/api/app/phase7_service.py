@@ -672,6 +672,7 @@ def load_prediction_run(db: Session, job_id: str, run_id: str, *, actor: str = "
         lines_by_shipment[line.prediction_shipment_id].append(line)
     spbu_ids = {line.spbu_id for line in lines}
     spbus = {row.spbu_id: row for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()} if spbu_ids else {}
+    shift_by_lo = {row.get("loading_order_no"): row for row in run.input_loading_order_snapshot or []}
     for line in lines:
         shipment = shipment_by_id[line.prediction_shipment_id]
         assignment = assignment_by_shipment.get(shipment.id)
@@ -681,6 +682,9 @@ def load_prediction_run(db: Session, job_id: str, run_id: str, *, actor: str = "
                 lo_state_id=uuid.uuid4().hex,
                 job_id=job.job_id,
                 loading_order_id=line.loading_order_no,
+                shift_id=shift_by_lo.get(line.loading_order_no, {}).get("shift_id"),
+                shift_name=shift_by_lo.get(line.loading_order_no, {}).get("shift"),
+                shift_gate_out_deadline=datetime.fromisoformat(shift_by_lo[line.loading_order_no]["shift_gate_out_deadline"]) if shift_by_lo.get(line.loading_order_no, {}).get("shift_gate_out_deadline") else None,
                 spbu_id=line.spbu_id,
                 spbu_name_snapshot=spbus[line.spbu_id].spbu_name if line.spbu_id in spbus else line.spbu_no,
                 product_id=line.product_id,
@@ -747,6 +751,9 @@ def list_job_los(db: Session, job_id: str) -> list[dict]:
             "current_trip": row.current_trip_number,
             "current_shipment": row.current_shipment_id,
             "current_compartment": row.current_compartment_id,
+            "shift_id": row.shift_id,
+            "shift_name": row.shift_name,
+            "shift_gate_out_deadline": _iso(row.shift_gate_out_deadline),
             "planned_gate_out": _iso(row.planned_gate_out),
             # This is intentionally resolved from the LO's exact trip instead
             # of VehicleOperationalState.system_eta_depot.  The latter is a
@@ -1328,6 +1335,9 @@ def validate_job(db: Session, job_id: str, parameters: dict | None = None, *, re
         add("DEPOT_OPERATING_WINDOW_REQUIRED", "BLOCKED", "Master Depot must contain both depot_operational_start and depot_operational_end.")
     if job.depot_operational_start is None or job.depot_operational_end is None:
         add("JOB_DEPOT_OPERATING_WINDOW_REQUIRED", "BLOCKED", "Phase 7 Job is missing its Depot operating-window snapshot.")
+    missing_shift = [row for row in lo_rows if row.status == "PLANNED" and not row.shift_gate_out_deadline]
+    if missing_shift and constraint_rule(parameters, "shift_compliance").get("enabled", True):
+        add("LO_SHIFT_DEADLINE_MISSING", "BLOCKED" if depot and depot.operational_shifts else "WARNING", f"{len(missing_shift)} LO have no operational shift deadline. Configure Master Depot shifts and upload a new Phase 6 run with shift values to enforce Shift Compliance.")
     missing_eta, _ = _planned_eta_issues(vehicles)
     if missing_eta:
         add("PLANNED_ETA_DEPOT_REQUIRED", "BLOCKED", f"Planned ETA Depot is required for all {len(missing_eta)} MT before optimization.")
@@ -1671,6 +1681,8 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             end_minutes = max(start_minutes, round((end - day_start).total_seconds() / 60))
         lo_payload.append(
             {
+                "shift_id": row.shift_id,
+                "shift_gate_out_deadline": _utc(row.shift_gate_out_deadline) if row.shift_gate_out_deadline else None,
                 "matrix_node_index": matrix_node_index,
                 "loading_order_id": row.loading_order_id,
                 "spbu_id": row.spbu_id,
@@ -3078,10 +3090,13 @@ def get_lo_comparison(db: Session, job_id: str, source_a: str, source_b: str) ->
 
 
 def _spbu_stop_metadata(trip, sequence):
+    timing = (trip.cost_breakdown or {}).get("trip_timing") or {}
+    component = next((item for item in timing.get("spbu_service_components", []) if item["sequence"] == sequence), {})
+    details = {key: component[key] for key in ("administration_seconds", "discharge_seconds", "unloaded_compartment_count") if key in component}
     meta = next((item for item in ((trip.cost_breakdown or {}).get("trip_timing") or {}).get("spbu_visits", []) if item["sequence"] == sequence), None)
     if not meta:
-        return {"spbu_queue_seconds": 0, "unloading_start_time": None}
-    return {"spbu_queue_seconds": meta["queue_seconds"], "unloading_start_time": _iso(_utc(trip.gate_out)+timedelta(seconds=meta["unloading_start_offset_seconds"]))}
+        return {**details, "spbu_queue_seconds": 0, "unloading_start_time": None}
+    return {**details, "spbu_queue_seconds": meta["queue_seconds"], "unloading_start_time": _iso(_utc(trip.gate_out)+timedelta(seconds=meta["unloading_start_offset_seconds"]))}
 
 
 def get_route_version(db: Session, job_id: str, version_id: str | None = None) -> dict:

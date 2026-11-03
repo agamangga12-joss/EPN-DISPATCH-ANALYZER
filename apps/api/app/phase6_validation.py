@@ -13,6 +13,7 @@ from openpyxl import load_workbook
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .shift_compliance import resolve_shift, shift_deadline, validate_operational_shifts
 from .departure_intelligence import shift_for_minute, validate_shift_config
 from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterProduct, MasterSPBU, ProductAlias, SpbuIdentifierAlias
 from .normalization import clean_str, normalize_key
@@ -158,6 +159,8 @@ def validate_loading_orders(
         file_name=file_name,
         required_columns=LOADING_ORDER_COLUMNS,
         aliases={
+            "shift_id": "shift",
+            "shift_name": "shift",
             "loading_order_no": "loading_order_no",
             "loading_order_number": "loading_order_no",
             "loading_order_id": "loading_order_no",
@@ -186,6 +189,7 @@ def validate_loading_orders(
             "loading_order_no": clean_str(row.get("loading_order_no")),
             "shipment_start_datetime": clean_str(row.get("shipment_start_datetime")),
             "spbu_no": clean_str(row.get("spbu_no")),
+            "shift": clean_str(row.get("shift")),
             "product": clean_str(row.get("product")),
             "order_quantity_kl": clean_str(row.get("order_quantity_kl")),
         }
@@ -194,6 +198,8 @@ def validate_loading_orders(
 
     timezone_info = _depot_timezone(db, depot_id)
     shift_config = _model_shift_config(model)
+    depot = db.get(MasterDepot, depot_id)
+    operational_shifts = validate_operational_shifts(depot.operational_shifts if depot else [])
     spbus = db.scalars(select(MasterSPBU)).all()
     spbu_by_id = {spbu.spbu_id: spbu for spbu in spbus}
     spbu_by_key = {key: spbu for spbu in spbus for key in {normalize_key(spbu.spbu_id), normalize_key(spbu.spbu_code)} if key}
@@ -266,12 +272,23 @@ def validate_loading_orders(
         ):
             local = parsed.astimezone(timezone_info)
             shift = shift_for_minute(local.hour * 60 + local.minute, shift_config)
+            operational = resolve_shift(operational_shifts, row.get("shift"))
+            if operational_shifts and not operational:
+                issues.append(_issue(file_name, row_number, "shift", "ERROR", "INVALID_OPERATIONAL_SHIFT", "Specify a shift ID/name configured in Master Depot."))
+                continue
+            if row.get("shift") and not operational_shifts:
+                issues.append(_issue(file_name, row_number, "shift", "ERROR", "DEPOT_SHIFTS_REQUIRED", "Configure operational shifts in Master Depot before uploading explicit shifts."))
+                continue
+            deadline = shift_deadline(local.date(), operational, timezone_info.key) if operational else None
+            if operational:
+                shift = operational
             normalized_rows.append(
                 {
                     "source_row_number": row_number,
                     "loading_order_no": clean_str(row["loading_order_no"]),
                     "shipment_start_datetime": parsed.isoformat(),
                     "shipment_start_datetime_local": local.isoformat(),
+                    "shift_gate_out_deadline": deadline.isoformat() if deadline else None,
                     "shift_id": shift["shift_id"],
                     "shift": shift["name"],
                     "spbu_id": spbu.spbu_id,

@@ -526,3 +526,23 @@ Operational cycle: PARKING_DEPOT ? READY_SIOD ? QUEUEING ? LOADING ? ON_TRIP ? R
 Newly loaded MT starts as PARKING_DEPOT. READY_SIOD means vehicle checks and AMT assignment are complete; the dispatcher updates this status manually. Other available statuses remain eligible for future shipments using Planned ETA Depot and all existing constraints. UNAVAILABLE follows the MT Availability constraint.
 
 The routing objective applies a 100,000-point preference for dispatching READY_SIOD vehicles, and coordination scoring rewards each ready physical MT used once. This is a soft preference, so feasibility, frozen assignments and the overall objective can outweigh it. It does not change reported financial activation costs. The preference is consumed after the first accepted trip within a solve; it does not repeatedly prioritize that MT on later trips. Stored operational status remains dispatcher-controlled. Legacy READY inputs are accepted as READY_SIOD; migration 0035 converts stored READY values. Excel and API also accept labels with spaces.
+
+
+### Shift Compliance (operational LO deadlines)
+
+Configure Operational Shifts in Master Data > Depot: unique Shift ID/name, start time and gate-out cutoff in the depot timezone. Shifts need not cover the whole day. A cutoff earlier than the start time means the next day; equal start/end is rejected. The local date in the uploaded shipment_start_datetime is the shift start date, including for overnight shifts.
+
+Phase 6 Loading Order Excel templates and the LO editor include `shift` (Shift ID or name). Once the depot has operational shifts, every uploaded LO must specify a valid shift. The planned shipment start remains separate and may be earlier than the shift start. The deadline is snapshotted per LO in the prediction run and copied into Phase 7; later master edits do not rewrite an existing run/job. Legacy files remain supported when no operational shifts are configured, using model-derived shifts without operational deadlines. Phase 7 Validate warns for these legacy deadlines; if a depot already has operational shifts, missing deadlines block validation until a new Phase 6 run is uploaded or Shift Compliance is explicitly disabled.
+
+`Shift Compliance` defaults to HARD. Only the upper gate-out deadline applies; early departure is allowed, including before shift start. Exact cutoff is valid. Bay scheduling and the final post-bay check include queue, loading, gate processing, and coordinated schedule changes. HARD violations are retried using compatible MT before final drop with `SHIFT_DEADLINE_EXCEEDED`. Existing execution/freeze rules still apply. Trips already executed/in progress are retained and are not retroactively rescheduled.
+
+SOFT mode permits late gate-out and charges the configured penalty per started late minute **per LO**. A trip with mixed shifts satisfies each LO separately; HARD uses the earliest cutoff, while SOFT sums late minutes for affected LO only. Penalties and late minutes are shown in trip soft-constraint violations. DISABLED ignores deadlines. The FIFO bay scheduler uses earlier deadlines to break equal-readiness ties and evaluates soft lateness in bay selection. CP-SAT enforces/prices each LO cutoff directly. Phase 7 rechecks final gate-out after coordinated scheduling and repair, and removes stale lateness entries before recalculating penalties.
+
+Migration: `0036_shift_compliance` adds depot shift configuration and nullable LO deadline snapshots. No shifts or deadlines are inferred for existing jobs during migration.
+
+
+### SPBU administration, discharge, and pairing distance (v15)
+
+SPBU Service Time now represents administration per visit. Sequential discharge is an additional configurable time per compartment unloaded at that SPBU (default 15 minutes). Stop timing, SPBU slot occupancy/queues, next-stop ETA, depot return and MT working time include both components. Profiles expose both parameters; trip details show their separate totals. Receiving-window entry applies to the physical visit, not every intermediate LO while sequential discharge is in progress.
+
+SPBU Pairing Distance checks every unique SPBU pair in a trip against a configurable `limit_km`. Distance is the larger directional road distance from the same routing matrix. HARD forbids exceeding pairs; SOFT adds penalty per excess kilometre per unique pair. Defaults: SOFT, 20 km, penalty 1000/km. Historical Pairing remains independently configurable. See SPBU_SERVICE_DISCHARGE_DESIGN.md for timing examples and audit details.

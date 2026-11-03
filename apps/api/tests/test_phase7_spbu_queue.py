@@ -192,8 +192,9 @@ def test_coordinated_unloading_is_persisted_and_exposed_in_route_details(workspa
     result=run_optimization(db,"J",{"current_time":NOW.isoformat(),"route_time_limit_confirmed":True,"parameters":{"refueling_minutes":0,"driving_break_minutes":0,"gate_process_time":0,"maximum_trips_per_mt":1,"route_optimization_time_limit":2,"bay_optimization_time_limit":5,"spbu_route_search_iterations":1}},reroute=False)
     assert len(result["trips"])==2,result
     stops=[stop for trip in result["trips"] for stop in trip["stops"]]
-    assert sum(stop["spbu_queue_seconds"] for stop in stops)==1800
-    assert all(stop["service_minutes"]==30 for stop in stops)
+    assert sum(stop["spbu_queue_seconds"] for stop in stops)==2700
+    assert all(stop["service_minutes"]==45 for stop in stops)
+    assert all(stop["administration_seconds"]==1800 and stop["discharge_seconds"]==900 and stop["unloaded_compartment_count"]==1 for stop in stops)
     slots=sorted((datetime.fromisoformat(s["unloading_start_time"]),datetime.fromisoformat(s["departure_time"])) for s in stops)
     assert slots[1][0]>=slots[0][1]
-    assert sum(trip["cost_breakdown"]["queue_cost"] for trip in result["trips"])==30000
+    assert sum(trip["cost_breakdown"]["queue_cost"] for trip in result["trips"])==45000

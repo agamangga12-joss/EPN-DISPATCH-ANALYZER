@@ -52,14 +52,14 @@ def test_solver_adds_fuel_and_driving_breaks():
     trip=result["trips"][0]
     assert trip["driving_seconds"] == 36000
     assert trip["trip_timing"]["break_seconds"] == 3600
-    assert trip["operating_minutes"] == 700
+    assert trip["operating_minutes"] == 715
     assert (trip["stops"][0]["arrival"] - trip["gate_out"]).total_seconds() == 22200
 
 
 def test_solver_manual_speed_changes_duration():
     trip=solve(travel_time_mode="MANUAL_SPEED",average_speed_kmh=75)["trips"][0]
     assert trip["driving_seconds"] == 14400
-    assert trip["operating_minutes"] == 280
+    assert trip["operating_minutes"] == 295
 
 
 def test_break_and_refueling_make_tight_receiving_window_infeasible():
@@ -110,7 +110,7 @@ def test_run_persists_timing_with_actual_bay_gate_out(workspace, monkeypatch, st
     monkeypatch.setattr(RouteMatrixService,"build",lambda *a,**kw:{"distance_matrix":[[0,150000],[150000,0]],"time_matrix":[[0,18000],[18000,0]],"geometry":{},"metadata":{}})
     monkeypatch.setattr(RouteMatrixService,"build_route_geometry",lambda *a,**kw:{"route_geometry":[],"route_geometry_source":"TEST"})
     now=datetime(2026,10,29,tzinfo=timezone.utc)
-    result=run_optimization(db,"J",{"current_time":now.isoformat(),"route_time_limit_confirmed":True,"parameters":{"route_optimization_time_limit":1,"default_spbu_service_minutes":0,"bay_scheduler_strategy":strategy,"bay_optimization_time_limit":1}},reroute=False)
+    result=run_optimization(db,"J",{"current_time":now.isoformat(),"route_time_limit_confirmed":True,"parameters":{"route_optimization_time_limit":1,"default_spbu_service_minutes":0,"bay_scheduler_strategy":strategy,"bay_optimization_time_limit":1,"constraint_rules":{"vehicle_working_time":{"limit_minutes":900}}}},reroute=False)
     assert result["trips"], result
     trip=result["trips"][0]
     assert trip["trip_timing"]["refueling_seconds"] == 2400

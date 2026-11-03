@@ -69,6 +69,7 @@ class DemoMTAvailabilityRequest(BaseModel):
 
 
 class ManagedLoadingOrderRow(BaseModel):
+    shift: str | None = Field(default=None, max_length=120)
     loading_order_no: str | None = Field(default=None, max_length=200)
     shipment_start_datetime: str | None = Field(default=None, max_length=100)
     spbu_no: str | None = Field(default=None, max_length=200)

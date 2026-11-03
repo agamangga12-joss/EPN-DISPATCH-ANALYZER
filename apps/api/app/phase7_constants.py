@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 
-PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v13"
+PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v15"
 
 JOB_STATUSES = {"DRAFT", "READY", "CALCULATING", "COMPLETED", "ACTIVE", "CLOSED", "FAILED"}
 LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
@@ -12,6 +12,8 @@ SOLVER_STATUSES = {"OPTIMAL", "FEASIBLE", "PARTIAL", "INFEASIBLE", "UNKNOWN", "T
 OBJECTIVES = {"MIN_TOTAL_COST", "MIN_TOTAL_DISTANCE", "MIN_TOTAL_OPERATING_TIME"}
 CONSTRAINT_MODES = {"HARD", "SOFT"}
 DROPPED_REASON_CODES = {
+    "SPBU_PAIRING_DISTANCE",
+    "SHIFT_DEADLINE_EXCEEDED",
     "NO_COMPATIBLE_MT",
     "INSUFFICIENT_CAPACITY",
     "FULL_LOAD_NOT_MET",
@@ -179,6 +181,14 @@ CONSTRAINT_DEFINITIONS: dict[str, dict] = {
         "default_penalty": 150_000.0,
         "legacy_penalty": "phase6_shipment_change_penalty",
     },
+    "spbu_pairing_distance": {
+        "label": "SPBU Pairing Distance",
+        "category": "ROUTING",
+        "description": "All unique SPBU pairs in a trip must meet the maximum road distance. Uses the larger directional distance. SOFT penalty per excess km per pair.",
+        "default_mode": "SOFT",
+        "default_penalty": 1000.0,
+        "default_limit_km": 20.0,
+    },
     "historical_pairing_preference": {
         "label": "Historical SPBU Pairing",
         "category": "PREFERENCE",
@@ -219,6 +229,13 @@ CONSTRAINT_DEFINITIONS: dict[str, dict] = {
         "default_penalty": 50_000.0,
         "legacy_penalty": "route_sequence_change_penalty",
     },
+    "shift_compliance": {
+        "label": "Shift Compliance",
+        "category": "TIME",
+        "description": "Final gate-out must not exceed each LO shift deadline. Early departure is allowed. SOFT penalty is per late minute per LO.",
+        "default_mode": "HARD",
+        "default_penalty": 1000.0,
+    },
     "gateout_stability": {
         "label": "Gate-Out Stability",
         "category": "REROUTE",
@@ -236,6 +253,7 @@ def default_constraint_rules() -> dict[str, dict]:
             "enabled": True,
             "mode": definition["default_mode"],
             "penalty": float(definition["default_penalty"]),
+            **({"limit_km": float(definition["default_limit_km"])} if definition.get("default_limit_km") is not None else {}),
             **({"limit_minutes": int(definition["default_limit_minutes"])} if definition.get("default_limit_minutes") is not None else {}),
         }
         for constraint_id, definition in CONSTRAINT_DEFINITIONS.items()
@@ -303,6 +321,7 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "driving_break_interval_minutes": 240,
     "driving_break_minutes": 30,
     "default_spbu_service_minutes": 30,
+    "discharge_minutes_per_compartment": 15,
     "cost_per_km": 10_000.0,
     "cost_per_operating_hour": 50_000.0,
     "queue_cost": 1_000.0,
@@ -397,12 +416,15 @@ def effective_parameters(overrides: dict | None = None) -> dict:
             "enabled": bool(supplied.get("enabled", rules[constraint_id]["enabled"])),
             "mode": mode,
             "penalty": penalty,
+            **({"limit_km": float(supplied.get("limit_km", rules[constraint_id]["limit_km"]))} if "limit_km" in rules[constraint_id] else {}),
             **(
                 {"limit_minutes": int(supplied.get("limit_minutes", rules[constraint_id]["limit_minutes"]))}
                 if "limit_minutes" in rules[constraint_id]
                 else {}
             ),
         }
+        if "limit_km" in rules[constraint_id] and (not math.isfinite(rules[constraint_id]["limit_km"]) or not 0 < rules[constraint_id]["limit_km"] <= 20000):
+            raise ValueError(f"constraint_rules.{constraint_id}.limit_km must be finite and between 0 (exclusive) and 20000")
         if "limit_minutes" in rules[constraint_id] and not 1 <= int(rules[constraint_id]["limit_minutes"]) <= 2880:
             raise ValueError(f"constraint_rules.{constraint_id}.limit_minutes must be between 1 and 2880")
         if legacy_key:
@@ -444,6 +466,7 @@ def effective_parameters(overrides: dict | None = None) -> dict:
         "maximum_trips_per_mt": (1, 20),
         "mt_turnaround_buffer_minutes": (0, 1440),
         "default_spbu_service_minutes": (0, 1440),
+        "discharge_minutes_per_compartment": (0, 1440),
         "gate_process_time": (0, 240),
         "route_matrix_cache_ttl_minutes": (1, 10080),
         "route_matrix_time_limit_seconds": (1, 900),

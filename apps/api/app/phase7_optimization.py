@@ -9,7 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from .phase7_constants import constraint_is_hard, constraint_is_soft, constraint_penalty, constraint_rule
-from .phase7_timing import travel_time_matrix, trip_clock
+from .phase7_timing import travel_time_matrix, trip_clock, spbu_stop_service, pairing_distance_violations
 
 try:  # The production image installs OR-Tools; this guard keeps diagnostics import-safe.
     from ortools.constraint_solver import pywrapcp, routing_enums_pb2
@@ -25,6 +25,20 @@ except ImportError:  # pragma: no cover - exercised only in incomplete host envi
 
 def _utc(value: datetime) -> datetime:
     return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _shift_violations(trip: dict, parameters: dict) -> list[dict]:
+    if not constraint_is_soft(parameters, "shift_compliance"):
+        return []
+    violations = []
+    for lo in trip.get("lo_assignments") or []:
+        deadline = lo.get("shift_gate_out_deadline")
+        if deadline and _utc(trip["gate_out"]) > _utc(deadline):
+            late = math.ceil((_utc(trip["gate_out"]) - _utc(deadline)).total_seconds() / 60)
+            violations.append({"constraint_id": "shift_compliance", "entity": lo["loading_order_id"],
+                               "late_minutes": late, "deadline": _utc(deadline).isoformat(),
+                               "penalty": late * constraint_penalty(parameters, "shift_compliance")})
+    return violations
 
 
 def _minutes_between(start: datetime, end: datetime) -> int:
@@ -227,6 +241,9 @@ class VRPOptimizationService:
             selected = []
             used = 0.0
             for node in allowed:
+                pair_candidates = [{**remaining[i - 1], "matrix_node_index": i} for i in [*selected, node]]
+                if constraint_is_hard(parameters, "spbu_pairing_distance") and pairing_distance_violations(pair_candidates, distance_matrix, parameters):
+                    continue
                 volume = float(remaining[node - 1]["volume_kl"])
                 previous = selected[-1] if selected else 0
                 if time_matrix[previous][node] >= 1_000_000_000 or time_matrix[node][0] >= 1_000_000_000:
@@ -331,7 +348,7 @@ class VRPOptimizationService:
             source = manager.IndexToNode(from_index)
             target = manager.IndexToNode(to_index)
             same_stop = source and target and remaining[source-1]["spbu_id"] == remaining[target-1]["spbu_id"]
-            service = 0 if same_stop else (service_minutes if source else (int(parameters.get("refueling_minutes", 0)) if target else 0))
+            service = ((0 if same_stop else service_minutes) + int(parameters.get("discharge_minutes_per_compartment", 15))) if source else (int(parameters.get("refueling_minutes", 0)) if target else 0)
             return math.ceil(time_matrix[source][target] / 60) + service
 
         minute_index = routing.RegisterTransitCallback(minute_callback)
@@ -429,7 +446,7 @@ class VRPOptimizationService:
                     cp.Add(before+after >= routing.ActiveVar(index))
 
         objective = parameters["objective"]
-        use_elapsed_cost = bool(parameters.get("refueling_minutes", 0) or parameters.get("driving_break_minutes", 0))
+        use_elapsed_cost = bool(parameters.get("refueling_minutes", 0) or parameters.get("driving_break_minutes", 0) or parameters.get("discharge_minutes_per_compartment", 15))
         for vehicle_index, vehicle in enumerate(vehicles):
             def cost_callback(from_index: int, to_index: int, vehicle_index: int = vehicle_index) -> int:
                 source = manager.IndexToNode(from_index)
@@ -543,6 +560,12 @@ class VRPOptimizationService:
         for node, lo in enumerate(remaining, start=1):
             index = manager.NodeToIndex(node)
             allowed = [mt_index_by_id[mt_id] for mt_id in lo.get("allowed_vehicle_ids") or [] if mt_id in mt_index_by_id]
+            deadline = lo.get("shift_gate_out_deadline")
+            if deadline and constraint_is_hard(parameters, "shift_compliance"):
+                deadline_minutes = math.floor((_utc(deadline) - _utc(day_start)).total_seconds() / 60)
+                for vehicle_index in allowed:
+                    assigned = cp.IsEqualCstVar(routing.VehicleVar(index), vehicle_index)
+                    cp.Add(time_dimension.CumulVar(routing.Start(vehicle_index)) <= deadline_minutes + (time_horizon + abs(deadline_minutes)) * (1 - assigned))
             preferred = lo.get("phase6_predicted_vehicle_id")
             if constraint_is_hard(parameters, "phase6_vehicle_preference") and preferred in mt_index_by_id:
                 allowed = [vehicle_index for vehicle_index in allowed if vehicle_index == mt_index_by_id[preferred]]
@@ -586,7 +609,17 @@ class VRPOptimizationService:
                 start = int(lo["time_window_start_minutes"])
                 end = int(lo["time_window_end_minutes"])
                 if constraint_is_hard(parameters, "spbu_time_window"):
-                    time_dimension.CumulVar(index).SetRange(start, end)
+                    time_dimension.CumulVar(index).SetMin(start)
+                    # LO nodes at one SPBU share a physical visit. Intermediate
+                    # nodes include sequential discharge, but only the visit
+                    # entry must meet the receiving-start cutoff.
+                    same_station_predecessors = [manager.NodeToIndex(other_node) for other_node, other in enumerate(remaining, 1)
+                                                 if other_node != node and other["spbu_id"] == lo["spbu_id"]]
+                    if same_station_predecessors:
+                        same_previous = routing.solver().Sum([routing.solver().IsEqualCstVar(routing.NextVar(previous), index) for previous in same_station_predecessors])
+                        routing.solver().Add(time_dimension.CumulVar(index) <= end + time_horizon * same_previous)
+                    else:
+                        time_dimension.CumulVar(index).SetMax(end)
                 elif constraint_is_soft(parameters, "spbu_time_window"):
                     time_dimension.SetCumulVarSoftLowerBound(index, start, constraint_penalty(parameters, "spbu_time_window"))
                     time_dimension.SetCumulVarSoftUpperBound(index, end, constraint_penalty(parameters, "spbu_time_window"))
@@ -639,6 +672,38 @@ class VRPOptimizationService:
                         )
                     if disallowed:
                         routing.NextVar(source_index).RemoveValue(manager.NodeToIndex(target_node))
+
+        pairing_rule = constraint_rule(parameters, "spbu_pairing_distance")
+        if pairing_rule.get("enabled", True):
+            by_station = defaultdict(list)
+            for node, lo in enumerate(remaining, 1):
+                by_station[str(lo["spbu_id"])].append(node)
+            stations = sorted(by_station)
+            distant_pairs = []
+            for offset, left in enumerate(stations):
+                for right in stations[offset + 1:]:
+                    a, b = by_station[left][0], by_station[right][0]
+                    excess = max(distance_matrix[a][b], distance_matrix[b][a]) / 1000 - float(pairing_rule.get("limit_km", 20))
+                    if excess > 0:
+                        distant_pairs.append((left, right, round(excess * float(pairing_rule["penalty"]))))
+            cp = routing.solver()
+            if constraint_is_hard(parameters, "spbu_pairing_distance"):
+                for left, right, _ in distant_pairs:
+                    for a in by_station[left]:
+                        for b in by_station[right]:
+                            ia, ib = manager.NodeToIndex(a), manager.NodeToIndex(b)
+                            cp.Add(cp.IsDifferentVar(routing.VehicleVar(ia), routing.VehicleVar(ib)) >= routing.ActiveVar(ia) + routing.ActiveVar(ib) - 1)
+            elif distant_pairs:
+                zero2 = routing.RegisterUnaryTransitCallback(lambda index: 0)
+                maximum = max(1, sum(weight for _, _, weight in distant_pairs))
+                routing.AddDimension(zero2, maximum, maximum, True, "PairingDistanceCost")
+                dimension = routing.GetDimensionOrDie("PairingDistanceCost")
+                for vi in range(len(vehicles)):
+                    present = {station: cp.Max([cp.IsEqualCstVar(routing.VehicleVar(manager.NodeToIndex(node)), vi) for node in nodes]) for station, nodes in by_station.items()}
+                    terms = [weight * cp.Min(present[left], present[right]) for left, right, weight in distant_pairs if weight]
+                    if terms:
+                        cp.Add(dimension.CumulVar(routing.End(vi)) >= cp.Sum(terms))
+                        dimension.SetCumulVarSoftUpperBound(routing.End(vi), 0, 1)
 
         search = pywrapcp.DefaultRoutingSearchParameters()
         # With exact-load end constraints and HARD pairing, insertion search
@@ -800,10 +865,16 @@ class VRPOptimizationService:
                         dropped.append({**lo, "reason_code": "COMPARTMENT_INFEASIBLE", "reason_description": "LO product volumes cannot be placed into this MT without mixing products inside a compartment."})
                         accepted_ids.add(str(lo["loading_order_id"]))
                     continue
+                pair_orders = [{**lo, "matrix_node_index": original_index[str(lo["loading_order_id"]) ]} for lo in route_los]
+                pairing_violations = pairing_distance_violations(pair_orders, distance_matrix, parameters)
+                if pairing_violations and constraint_is_hard(parameters, "spbu_pairing_distance"):
+                    continue
                 ready = _utc(day_start) + timedelta(minutes=int(raw_route.get("start_minutes") or 0))
                 grouped_stops: list[tuple[int, list[dict]]] = []
                 grouped_index: dict[str, int] = {}
-                for lo in route_los:
+                assigned_by_id = {row["loading_order_id"]: row for row in compartment_result["assignments"]}
+                for original_lo in route_los:
+                    lo = assigned_by_id[original_lo["loading_order_id"]]
                     spbu_id = str(lo["spbu_id"])
                     if spbu_id in grouped_index:
                         grouped_stops[grouped_index[spbu_id]][1].append(lo)
@@ -821,7 +892,11 @@ class VRPOptimizationService:
                     if constraint_is_hard(parameters, "spbu_time_window") else 0
                     for _, stop_los in grouped_stops
                 ]
-                timing = trip_clock(leg_times, int(parameters.get("default_spbu_service_minutes", 30)) * 60, parameters, earliest_arrivals)
+                stop_services = [spbu_stop_service(stop_los, parameters) for _, stop_los in grouped_stops]
+                timing = trip_clock(leg_times, [row["service_seconds"] for row in stop_services], parameters, earliest_arrivals)
+                timing["administration_seconds"] = sum(row["administration_seconds"] for row in stop_services)
+                timing["discharge_seconds"] = sum(row["discharge_seconds"] for row in stop_services)
+                timing["spbu_service_components"] = [{"sequence": i + 1, "spbu_id": stop_los[0]["spbu_id"], **stop_services[i]} for i, (_, stop_los) in enumerate(grouped_stops)]
                 previous = 0
                 drive_seconds = 0
                 stops = []
@@ -831,7 +906,7 @@ class VRPOptimizationService:
                     drive_seconds += leg_seconds
                     arrival = ready + timedelta(seconds=timing["arrival_offsets"][sequence - 1])
                     departure = ready + timedelta(seconds=timing["departure_offsets"][sequence - 1])
-                    stops.append({"sequence": sequence, "loading_order": stop_los[0], "loading_orders": stop_los, "arrival": arrival, "departure": departure, "leg_seconds": leg_seconds, "leg_distance_meters": int(distance_matrix[previous][node])})
+                    stops.append({**stop_services[sequence - 1], "sequence": sequence, "loading_order": stop_los[0], "loading_orders": stop_los, "arrival": arrival, "departure": departure, "leg_seconds": leg_seconds, "leg_distance_meters": int(distance_matrix[previous][node])})
                     arrival = departure
                     previous = node
                 return_seconds = int(time_matrix[previous][0])
@@ -899,6 +974,7 @@ class VRPOptimizationService:
                     arrival_minutes = _minutes_between(day_start, stop["arrival"])
                     if start is not None and end is not None and not int(start) <= arrival_minutes <= int(end) and constraint_is_soft(parameters, "spbu_time_window"):
                         constraint_violations.append({"constraint_id": "spbu_time_window", "penalty": constraint_penalty(parameters, "spbu_time_window"), "entity": lo["loading_order_id"]})
+                constraint_violations.extend(pairing_violations)
                 trip_number = int(vehicle.get("completed_trip_count") or 0) + 1
                 trip = {
                     "vehicle_id": vehicle["mt_id"],
@@ -912,7 +988,9 @@ class VRPOptimizationService:
                     "distance_meters": distance_meters,
                     "driving_seconds": drive_seconds,
                     "trip_timing": timing,
-                    "service_seconds": len(stops) * int(parameters.get("default_spbu_service_minutes", 30)) * 60,
+                    "service_seconds": sum(row["service_seconds"] for row in stop_services),
+                    "administration_seconds": sum(row["administration_seconds"] for row in stop_services),
+                    "discharge_seconds": sum(row["discharge_seconds"] for row in stop_services),
                     "operating_minutes": operating_minutes,
                     "stops": stops,
                     "lo_assignments": compartment_result["assignments"],
@@ -939,6 +1017,12 @@ class VRPOptimizationService:
             if lo.get("user_cancelled"):
                 code = "USER_CANCELLED"
                 description = "LO was cancelled by the dispatcher and is excluded from routing."
+            elif lo.get("shift_gate_out_deadline") and constraint_is_hard(parameters, "shift_compliance") and all(
+                max(_utc(vehicle_state[mt_id]["effective_eta_depot"]), _utc(vehicle_state[mt_id].get("optimization_reference_time") or day_start)) > _utc(lo["shift_gate_out_deadline"])
+                for mt_id in lo.get("allowed_vehicle_ids", []) if mt_id in vehicle_state
+            ):
+                code = "SHIFT_DEADLINE_EXCEEDED"
+                description = "Compatible MT cannot depart before the LO shift deadline."
             elif (time_matrix[0][original_index[str(lo["loading_order_id"])]] >= 1_000_000_000
                   or time_matrix[original_index[str(lo["loading_order_id"])]][0] >= 1_000_000_000):
                 code = "RESTRICTED_ROUTE_REVIEW_REQUIRED"
@@ -1151,7 +1235,7 @@ class BayQueueOptimizationService:
             indexes.sort(key=lambda index: (int(trips[index].get("trip_number") or 0), index))
 
         trip_position_by_vehicle: dict[str, int] = {vehicle_id: 0 for vehicle_id in trips_by_vehicle}
-        ready_heap: list[tuple[datetime, datetime, int, str, str, int]] = []
+        ready_heap: list[tuple[datetime, datetime, datetime, int, str, str, int]] = []
 
         def push_trip(trip_index: int, ready_at: datetime) -> None:
             trip = trips[trip_index]
@@ -1163,6 +1247,7 @@ class BayQueueOptimizationService:
                 ready_heap,
                 (
                     _utc(ready_at),
+                    min((_utc(lo["shift_gate_out_deadline"]) for lo in trip.get("lo_assignments") or [] if lo.get("shift_gate_out_deadline")), default=datetime.max.replace(tzinfo=timezone.utc)) if constraint_rule(parameters, "shift_compliance").get("enabled", True) else datetime.max.replace(tzinfo=timezone.utc),
                     _utc(trip.get("preliminary_gate_out") or trip.get("gate_out") or ready_at),
                     int(trip.get("trip_number") or 0),
                     str(trip.get("vehicle_id") or ""),
@@ -1186,7 +1271,7 @@ class BayQueueOptimizationService:
         )
 
         while ready_heap:
-            ready_at, _, _, vehicle_id, _, trip_index = heapq.heappop(ready_heap)
+            ready_at, _, _, _, vehicle_id, _, trip_index = heapq.heappop(ready_heap)
             trip = trips[trip_index]
             trip_products = {
                 str(row.get("product_id") or "UNKNOWN")
@@ -1200,6 +1285,7 @@ class BayQueueOptimizationService:
             candidates: list[tuple[tuple, dict]] = []
             structurally_eligible = False
             window_exhausted = False
+            shift_exhausted = False
             eligible_bay_ids: list[str] = []
 
             for bay in active_bays:
@@ -1244,6 +1330,12 @@ class BayQueueOptimizationService:
                     window_exhausted = True
                     continue
 
+                if constraint_is_hard(parameters, "shift_compliance") and any(
+                    lo.get("shift_gate_out_deadline") and gate_out > _utc(lo["shift_gate_out_deadline"])
+                    for lo in trip.get("lo_assignments") or []
+                ):
+                    shift_exhausted = True
+                    continue
                 violations: list[dict] = []
                 if product_violation and constraint_is_soft(parameters, "bay_product_compatibility"):
                     violations.append({
@@ -1269,6 +1361,7 @@ class BayQueueOptimizationService:
                         "penalty": constraint_penalty(parameters, "depot_operating_window"),
                         "entity": bay_id,
                     })
+                violations.extend(_shift_violations({**trip, "gate_out": gate_out}, parameters))
                 penalty_cost = sum(float(row.get("penalty") or 0) for row in violations)
                 flexibility = 1_000_000 if bay.get("all_products_allowed") else len(allowed_products)
                 projected_workload = int(state["assigned_loading_minutes"]) + loading_minutes
@@ -1291,7 +1384,7 @@ class BayQueueOptimizationService:
                 }))
 
             if not candidates:
-                reason = "BAY_WINDOW_EXHAUSTED" if structurally_eligible and window_exhausted else "BAY_PRODUCT_CONSTRAINT"
+                reason = "SHIFT_DEADLINE_EXCEEDED" if shift_exhausted else ("BAY_WINDOW_EXHAUSTED" if structurally_eligible and window_exhausted else "BAY_PRODUCT_CONSTRAINT")
                 dropped.append(trip_index)
                 dropped_reasons[trip_index] = reason
                 # Preserve physical trip order: a later trip cannot use the MT
@@ -1462,6 +1555,18 @@ class BayQueueOptimizationService:
             # infeasible merely because its MT becomes ready after depot close.
             # Readiness is operationally relevant only when the trip is served.
             model.add(starts[trip_index] >= ready).only_enforce_if(served[trip_index])
+            for lo_index, lo in enumerate(trip.get("lo_assignments") or []):
+                deadline = lo.get("shift_gate_out_deadline")
+                if not deadline:
+                    continue
+                cutoff = math.floor((_utc(deadline) - _utc(day_start)).total_seconds() / 60)
+                if constraint_is_hard(parameters, "shift_compliance"):
+                    model.add(ends[trip_index] + gate_process <= cutoff).only_enforce_if(served[trip_index])
+                elif constraint_is_soft(parameters, "shift_compliance"):
+                    late = model.new_int_var(0, horizon + gate_process + abs(cutoff), f"shift_late_{trip_index}_{lo_index}")
+                    model.add(late >= ends[trip_index] + gate_process - cutoff).only_enforce_if(served[trip_index])
+                    model.add(late == 0).only_enforce_if(served[trip_index].Not())
+                    objective_terms.append(constraint_penalty(parameters, "shift_compliance") * late)
             trip_products = {str(row.get("product_id") or "UNKNOWN") for row in trip.get("lo_assignments") or []}
             current_bays = {str(row["current_bay_id"]) for row in trip.get("lo_assignments") or [] if row.get("current_bay_id")}
             for bay_index, bay in enumerate(bays):
@@ -1656,6 +1761,10 @@ class BayQueueOptimizationService:
             index: ("BAY_PRODUCT_CONSTRAINT" if not eligible_by_trip[index] else "BAY_CONGESTION")
             for index in dropped
         }
+        if constraint_is_hard(parameters, "shift_compliance"):
+            for index in dropped:
+                if any(lo.get("shift_gate_out_deadline") for lo in trips[index].get("lo_assignments") or []):
+                    dropped_reasons[index] = "SHIFT_DEADLINE_EXCEEDED"
         return {
             "solver_status": "PARTIAL" if assignments and dropped else translated_status,
             "assignments": assignments,
@@ -1904,6 +2013,7 @@ class OptimizationCoordinatorService:
             for index, reason in (bay_result.get("dropped_trip_reasons") or {}).items()
         }
         reason_descriptions = {
+            "SHIFT_DEADLINE_EXCEEDED": "No feasible loading slot permits final gate-out before the LO shift deadline.",
             "SPBU_CONGESTION": "No coordinated loading/unloading schedule satisfies SPBU capacity, receiving windows and physical MT availability within the available search budget.",
             "BAY_PRODUCT_CONSTRAINT": "No eligible loading bay satisfies the active hard product, loading-duration, or bay-stability constraints.",
             "BAY_CONGESTION": "The bay scheduler omitted this otherwise eligible trip because available bay capacity/time was insufficient relative to the Serve Loading Order penalty.",
@@ -1919,7 +2029,7 @@ class OptimizationCoordinatorService:
         retryable_failures: set[int] = {
             index
             for index, reason_code in bay_drop_reason_codes.items()
-            if reason_code in {"BAY_WINDOW_EXHAUSTED", "BAY_CONGESTION", "BAY_PRODUCT_CONSTRAINT", "SPBU_CONGESTION"}
+            if reason_code in {"SHIFT_DEADLINE_EXCEEDED", "BAY_WINDOW_EXHAUSTED", "BAY_CONGESTION", "BAY_PRODUCT_CONSTRAINT", "SPBU_CONGESTION"}
         }
         tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
         working_limit = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
@@ -1934,6 +2044,14 @@ class OptimizationCoordinatorService:
             if trip_index in dropped:
                 continue
             vehicle_id = trip["vehicle_id"]
+            trip["constraint_violations"] = [row for row in trip.get("constraint_violations", []) if row.get("constraint_id") != "shift_compliance"]
+            late_orders = [lo for lo in trip.get("lo_assignments") or [] if lo.get("shift_gate_out_deadline") and _utc(trip["gate_out"]) > _utc(lo["shift_gate_out_deadline"])]
+            if late_orders and constraint_is_hard(parameters, "shift_compliance"):
+                dropped.add(trip_index)
+                retryable_failures.add(trip_index)
+                reasons[trip_index] = ("SHIFT_DEADLINE_EXCEEDED", "Final gate-out exceeds the LO shift deadline; another compatible MT will be attempted.")
+                continue
+            trip["constraint_violations"].extend(_shift_violations(trip, parameters))
             if constraint_is_hard(parameters, "vehicle_full_load") and abs(
                 sum(float(lo["volume_kl"]) for lo in trip.get("lo_assignments") or []) - vehicle_capacity[vehicle_id]
             ) > 1e-6:

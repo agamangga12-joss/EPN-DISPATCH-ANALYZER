@@ -326,6 +326,7 @@ type HistoryRow = {
   queue_error: string | null;
 };
 type ManagedLoadingOrder = {
+  shift: string;
   id: string;
   loading_order_no: string;
   shipment_start_datetime: string;
@@ -347,6 +348,7 @@ type ManagedMtAvailability = {
 
 const EMPTY_LOADING_ORDER_FILTERS: LoadingOrderFilters = {
   loading_order_no: "",
+  shift: "",
   shipment_start_datetime: "",
   spbu_no: "",
   product: "",
@@ -355,6 +357,7 @@ const EMPTY_LOADING_ORDER_FILTERS: LoadingOrderFilters = {
 const LOADING_ORDER_MANAGEMENT_COLUMNS: Array<{ field: LoadingOrderSortField; label: string; filterLabel: string; placeholder: string }> = [
   { field: "loading_order_no", label: "Loading Order No", filterLabel: "Filter nomor LO", placeholder: "Cari nomor LO…" },
   { field: "shipment_start_datetime", label: "Shipment Start", filterLabel: "Filter waktu shipment", placeholder: "Cari tanggal/jam…" },
+  { field: "shift", label: "Shift", filterLabel: "Filter shift", placeholder: "Cari shift" },
   { field: "spbu_no", label: "SPBU No", filterLabel: "Filter nomor SPBU", placeholder: "Cari SPBU…" },
   { field: "product", label: "Product", filterLabel: "Filter product", placeholder: "Cari product…" },
   { field: "order_quantity_kl", label: "Order (KL)", filterLabel: "Filter order KL", placeholder: "Cari KL…" },
@@ -374,6 +377,7 @@ function managedLoadingOrdersFromValidation(validation: Validation): ManagedLoad
   const normalizedBySourceRow = new Map(validation.normalized_rows.map((row) => [Number(row.source_row_number), row]));
   return rows.map((row, index) => ({
     id: globalThis.crypto?.randomUUID?.() ?? `loading-order-${Date.now()}-${index}`,
+    shift: String(row.shift ?? ""),
     loading_order_no: String(row.loading_order_no ?? ""),
     shipment_start_datetime: loadingOrderDateTimeInput(row.shipment_start_datetime_local ?? row.shipment_start_datetime),
     spbu_no: String(row.spbu_no ?? ""),
@@ -384,6 +388,7 @@ function managedLoadingOrdersFromValidation(validation: Validation): ManagedLoad
 
 function loadingOrderWorkbookRows(rows: ManagedLoadingOrder[]) {
   return rows.map((row) => ({
+    shift: row.shift.trim(),
     loading_order_no: row.loading_order_no.trim(),
     shipment_start_datetime: row.shipment_start_datetime.length === 16
       ? `${row.shipment_start_datetime.replace("T", " ")}:00`
@@ -1039,6 +1044,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
       row: {
         id: globalThis.crypto?.randomUUID?.() ?? `loading-order-${Date.now()}`,
         loading_order_no: "",
+        shift: managedLoadingOrders[0]?.shift ?? "",
         shipment_start_datetime: managedLoadingOrders[0]?.shipment_start_datetime ?? "",
         spbu_no: "",
         product: activeProducts[0]?.product_name ?? "",
@@ -1681,6 +1687,9 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
                 Nomor Loading Order
                 <input autoFocus required className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={loadingOrderEditor.row.loading_order_no} onChange={(event) => setLoadingOrderEditor((current) => current ? { ...current, row: { ...current.row, loading_order_no: event.target.value } } : null)} />
               </label>
+              <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Shift ID / Nama
+                <input className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={loadingOrderEditor.row.shift} onChange={(event) => setLoadingOrderEditor((current) => current ? { ...current, row: { ...current.row, shift: event.target.value } } : null)} />
+              </label>
               <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Shipment Start
                 <input required className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" type="datetime-local" value={loadingOrderEditor.row.shipment_start_datetime} onChange={(event) => setLoadingOrderEditor((current) => current ? { ...current, row: { ...current.row, shipment_start_datetime: event.target.value } } : null)} />
@@ -1775,7 +1784,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
       <section className="grid gap-5 lg:grid-cols-2">
         <div className="border border-line bg-white p-5">
           <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">3. Loading Order Upload</div>
-          <p className="mt-1 text-xs text-slate-500">Required: loading_order_no, shipment_start_datetime, spbu_no, product, dan order_quantity_kl. Product dipetakan ke Master Product canonical; shift diturunkan dari snapshot model.</p>
+          <p className="mt-1 text-xs text-slate-500">Required: loading_order_no, shipment_start_datetime, spbu_no, product, dan order_quantity_kl. Tambahkan kolom shift sesuai Shift ID/nama di Master Depot. Shift wajib jika master shift depot sudah dikonfigurasi. Tanpa master shift, file lama tetap memakai shift snapshot model dan belum memiliki deadline operasional.</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => downloadFromApi("/api/v1/phase6/templates/loading-order", "phase6-loading-order-template.xlsx")}><Download size={15} /> Download Template</button>
             <button type="button" className="inline-flex items-center gap-2 border border-petroblue px-3 py-2 text-sm text-petroblue disabled:border-line disabled:text-slate-400" disabled={!modelId || demoLoading} onClick={() => setDemoDialogOpen(true)}><Sparkles size={15} /> Data Demo</button>
@@ -1849,6 +1858,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
                   <tr key={row.id} className="border-t border-line">
                     <td className="px-3 py-3 font-medium text-petroink">{row.loading_order_no || "—"}</td>
                     <td className="whitespace-nowrap px-3 py-3 text-petroink">{row.shipment_start_datetime ? row.shipment_start_datetime.replace("T", " ") : "—"}</td>
+                    <td className="px-3 py-3 text-petroink">{row.shift || "-"}</td>
                     <td className="px-3 py-3 text-petroink">{row.spbu_no || "—"}</td>
                     <td className="px-3 py-3 text-petroink">{row.product || "—"}</td>
                     <td className="px-3 py-3 tabular-nums text-petroink">{row.order_quantity_kl || "—"}</td>
@@ -1861,7 +1871,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
                   </tr>
                 ))}
                 {paginatedLoadingOrders.length === 0 && (
-                  <tr><td colSpan={6} className="px-4 py-10 text-center text-sm text-slate-500">Tidak ada Loading Order yang cocok dengan filter saat ini.</td></tr>
+                  <tr><td colSpan={LOADING_ORDER_MANAGEMENT_COLUMNS.length + 1} className="px-4 py-10 text-center text-sm text-slate-500">Tidak ada Loading Order yang cocok dengan filter saat ini.</td></tr>
                 )}
               </tbody>
             </table>

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .shift_compliance import validate_operational_shifts
 
 import csv
 import base64
@@ -1675,6 +1676,7 @@ def build_crud_record(domain: str, payload: dict):
             longitude=source_number(payload.get("longitude")),
             region=clean_str(payload.get("region")),
             timezone=clean_str(payload.get("timezone")) or "Asia/Jakarta",
+            operational_shifts=validate_operational_shifts(payload.get("operational_shifts")),
             depot_operational_start=source_time(payload.get("depot_operational_start"), time(0, 0)),
             depot_operational_end=source_time(payload.get("depot_operational_end"), time(23, 59)),
             active_status=clean_str(payload.get("active_status")) or "ACTIVE",
@@ -1769,7 +1771,7 @@ def build_crud_record(domain: str, payload: dict):
 
 def apply_crud_update(domain: str, record, payload: dict) -> None:
     allowed_fields = {
-        "DEPOT": ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "depot_operational_start", "depot_operational_end", "active_status"],
+        "DEPOT": ["operational_shifts", "depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "depot_operational_start", "depot_operational_end", "active_status"],
         "PRODUCT": ["product_name", "active_status"],
         "TAG_TYPE": ["code", "name", "description", "admin_editable"],
         "TAG": ["tag_type_id", "tag_value", "active_status"],
@@ -1781,7 +1783,9 @@ def apply_crud_update(domain: str, record, payload: dict) -> None:
         if field not in payload:
             continue
         value = payload[field]
-        if field in {"latitude", "longitude", "master_distance_km", "master_travel_time_min", "quantity", "source_distance_km", "actual_km"}:
+        if field == "operational_shifts":
+            value = validate_operational_shifts(value)
+        elif field in {"latitude", "longitude", "master_distance_km", "master_travel_time_min", "quantity", "source_distance_km", "actual_km"}:
             value = source_number(value)
         elif field in {"number_of_compartments", "vehicle_type_tag"}:
             value = source_int(value)

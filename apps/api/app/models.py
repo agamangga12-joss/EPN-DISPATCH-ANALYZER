@@ -95,6 +95,7 @@ class MasterDepot(Base):
     longitude: Mapped[float | None] = mapped_column(Float)
     region: Mapped[str | None] = mapped_column(String(120))
     timezone: Mapped[str | None] = mapped_column(String(80), default="Asia/Jakarta")
+    operational_shifts: Mapped[list] = mapped_column(JSON, default=list)
     depot_operational_start = mapped_column(Time, nullable=False, default=lambda: time(0, 0))
     depot_operational_end = mapped_column(Time, nullable=False, default=lambda: time(23, 59))
     active_status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
@@ -1371,6 +1372,9 @@ class LOOperationalState(Base):
         String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
     )
     loading_order_id: Mapped[str] = mapped_column(String(120), index=True)
+    shift_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    shift_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    shift_gate_out_deadline = mapped_column(DateTime(timezone=True), nullable=True)
     spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
     spbu_name_snapshot: Mapped[str | None] = mapped_column(String(255))
     product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))

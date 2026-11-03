@@ -1279,3 +1279,9 @@ Dokumen pendukung:
 
 
 Phase 7 MT readiness: MT baru dimuat sebagai `PARKING_DEPOT` (persiapan kendaraan/AMT belum selesai). Dispatcher mengubahnya menjadi `READY_SIOD` setelah siap. Solver memprioritaskan shipment pertama untuk MT `READY_SIOD` melalui preferensi objective; constraint dan feasibility tetap berlaku. Status lain tetap dapat menerima rencana shipment berdasarkan Planned ETA Depot. Status operasional diperbarui manual; optimasi tidak otomatis menjalankan transisi status. Migrasi `0035_phase7_mt_readiness` mengubah `READY` lama menjadi `READY_SIOD`.
+
+
+Phase 6/7 Shift Compliance: atur **Operational Shifts / Batas Gate-Out** di Master Data Depot, lalu isi kolom `shift` pada upload/template/editor LO Phase 6. Shift ID/nama harus sesuai master depot. Deadline disimpan per LO pada prediction run dan dibawa ke Phase 7. Constraint **Shift Compliance**: HARD melarang gate-out setelah deadline; SOFT memakai penalti per menit keterlambatan per LO; DISABLED mengabaikan deadline. Berangkat lebih awal diizinkan. Shift dan deadline tersedia di LO Management; pelanggaran SOFT tampil pada detail trip. Konfigurasi baru memerlukan migrasi `0036_shift_compliance`. Run lama tanpa deadline tidak otomatis diubah.
+
+
+Phase 7 v15: **SPBU Administration / Visit** dan **Sequential Discharge / Compartment** dipisahkan di parameter optimasi. Default discharge 15 menit per kompartemen yang dibongkar; antrean memakai total administrasi + discharge berurutan. **SPBU Pairing Distance** memeriksa seluruh pasangan SPBU dalam satu trip dengan batas km yang bisa diinput; HARD melarang pelanggaran, SOFT mengenakan penalti per km kelebihan per pasangan unik. Jarak memakai nilai terbesar dari dua arah pada routing matrix. Default constraint: SOFT, 20 km, penalti 1000/km. Tidak memerlukan migrasi database; versi route lama tetap memakai hasil tersimpan.
