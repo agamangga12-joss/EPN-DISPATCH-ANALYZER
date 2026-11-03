@@ -3,17 +3,18 @@ from __future__ import annotations
 import math
 
 
-PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v10"
+PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v13"
 
 JOB_STATUSES = {"DRAFT", "READY", "CALCULATING", "COMPLETED", "ACTIVE", "CLOSED", "FAILED"}
 LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
-MT_STATUSES = {"READY", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING", "UNAVAILABLE"}
+MT_STATUSES = {"PARKING_DEPOT", "READY_SIOD", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING", "UNAVAILABLE"}
 SOLVER_STATUSES = {"OPTIMAL", "FEASIBLE", "PARTIAL", "INFEASIBLE", "UNKNOWN", "TIMEOUT", "TIME_LIMIT", "FAILED"}
 OBJECTIVES = {"MIN_TOTAL_COST", "MIN_TOTAL_DISTANCE", "MIN_TOTAL_OPERATING_TIME"}
 CONSTRAINT_MODES = {"HARD", "SOFT"}
 DROPPED_REASON_CODES = {
     "NO_COMPATIBLE_MT",
     "INSUFFICIENT_CAPACITY",
+    "FULL_LOAD_NOT_MET",
     "COMPARTMENT_INFEASIBLE",
     "VEHICLE_TIME_EXHAUSTED",
     "DEPOT_TIME_EXHAUSTED",
@@ -46,6 +47,13 @@ CONSTRAINT_DEFINITIONS: dict[str, dict] = {
         "label": "Vehicle Capacity",
         "category": "ROUTING",
         "description": "Total LO volume assigned to one MT trip must fit the MT capacity.",
+        "default_mode": "HARD",
+        "default_penalty": 2_000_000.0,
+    },
+    "vehicle_full_load": {
+        "label": "Full Load per Trip",
+        "category": "ROUTING",
+        "description": "Every used MT trip must carry exactly its capacity; unused MT are allowed. SOFT applies one penalty per non-full trip.",
         "default_mode": "HARD",
         "default_penalty": 2_000_000.0,
     },

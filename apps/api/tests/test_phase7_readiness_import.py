@@ -76,7 +76,7 @@ def test_template_contains_all_job_mt_current_values_status_dropdown_and_depot_l
     assert "OTHER-REG" not in [row[0].value for row in sheet.iter_rows(min_row=2)]
     row = next(row for row in sheet.iter_rows(min_row=2) if row[0].value == "B1000AA")
     assert row[0].data_type == "s"
-    assert row[1].value == "READY"
+    assert row[1].value == "READY_SIOD"
     assert row[2].value == datetime(2026, 10, 8, 8)
     assert "UNAVAILABLE" in sheet.data_validations.dataValidation[0].formula1
     assert any("Asia/Makassar" in str(row[0].value) for row in workbook["Petunjuk"].iter_rows())
@@ -140,7 +140,11 @@ def test_template_roundtrip_keeps_utc_eta(workspace):
     response = upload(client, client.get(BASE + "/template").content)
     assert response.status_code == 200, response.text
     assert response.json()["imported_count"] == 3
-    assert_unchanged(db)
+    db.expire_all()
+    for index in range(3):
+        row = db.get(VehicleOperationalState, f"V{index}")
+        assert row.operational_status == "READY_SIOD"
+        assert row.planned_eta_depot.replace(tzinfo=timezone.utc) == ORIGINAL_ETA
 
 
 def test_import_is_blocked_when_job_is_calculating(workspace):
@@ -158,3 +162,18 @@ def test_invalid_or_empty_workbook_is_rejected(workspace, content):
     response = upload(client, content)
     assert response.status_code == 422
     assert_unchanged(db)
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("PARKING_DEPOT", "PARKING_DEPOT"), ("PARKING DEPOT", "PARKING_DEPOT"),
+    ("READY_SIOD", "READY_SIOD"), ("READY SIOD", "READY_SIOD"), ("READY", "READY_SIOD"),
+])
+def test_new_readiness_statuses_import_and_patch(workspace, status, expected):
+    client, db = workspace
+    response = upload(client, excel([["B1000AA", status, None]]))
+    assert response.status_code == 200, response.text
+    response = client.patch("/api/v1/phase7/jobs/J/vehicles", json={"updates": [{"mt_id": "M1", "operational_status": status}]})
+    assert response.status_code == 200, response.text
+    db.expire_all()
+    assert db.get(VehicleOperationalState, "V0").operational_status == expected
+    assert db.get(VehicleOperationalState, "V1").operational_status == expected

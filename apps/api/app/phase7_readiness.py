@@ -34,7 +34,7 @@ def readiness_template(db: Session, job_id: str) -> bytes:
     for row in vehicles:
         eta = row.planned_eta_depot
         local_eta = (eta if eta.tzinfo else eta.replace(tzinfo=timezone.utc)).astimezone(zone).replace(tzinfo=None) if eta else None
-        sheet.append([row.registration_snapshot or row.mt_id, row.operational_status, local_eta])
+        sheet.append([row.registration_snapshot or row.mt_id, "READY_SIOD" if row.operational_status == "READY" else row.operational_status, local_eta])
         sheet.cell(sheet.max_row, 1).data_type = "s"
         sheet.cell(sheet.max_row, 1).number_format = "@"
         sheet.cell(sheet.max_row, 3).number_format = "yyyy-mm-dd hh:mm:ss"
@@ -57,7 +57,7 @@ def readiness_template(db: Session, job_id: str) -> bytes:
         "MT Readiness — " + job.job_no,
         "MT REGISTRATION otomatis diisi untuk seluruh MT yang sudah dimuat pada Job ini, seluruh halaman.",
         "OPERATIONAL STATUS: " + ", ".join(sorted(MT_STATUSES)),
-        "READY = aktif/siap; UNAVAILABLE = tidak tersedia. Status lain mengikuti status operasional pada tabel.",
+        "PARKING_DEPOT = di depot, persiapan belum selesai; READY_SIOD = siap dan diprioritaskan untuk shipment; UNAVAILABLE = tidak tersedia.",
         f"PLANNED ETA DEPOT: tanggal dan jam zona waktu depot ({zone.key}).",
         "Gunakan sel tanggal Excel atau teks YYYY-MM-DD HH:MM:SS, contoh 2026-10-08 07:30:00.",
         "Kolom status dan ETA diisi dengan nilai tersimpan saat template diunduh; kolom kosong tidak mengubah nilai.",
@@ -134,7 +134,9 @@ def import_readiness(db: Session, job_id: str, content: bytes, filename: str) ->
             seen.add(key)
             update = {"mt_id": by_registration[key][0].mt_id} if len(by_registration.get(key, [])) == 1 else {}
             if status is not None and str(status).strip():
-                normalized_status = str(status).strip().upper()
+                normalized_status = str(status).strip().upper().replace(" ", "_")
+                if normalized_status == "READY":
+                    normalized_status = "READY_SIOD"
                 if normalized_status not in MT_STATUSES:
                     issues.append(f"Status {status} tidak valid. Pilih: {', '.join(sorted(MT_STATUSES))}.")
                 else:

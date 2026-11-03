@@ -893,7 +893,7 @@ def load_mt_from_master(db: Session, job_id: str, *, actor: str = "local-user") 
                 capacity_kl=capacity,
                 number_of_compartments=compartment_count,
                 compartment_configuration=compartments,
-                operational_status="READY",
+                operational_status="PARKING_DEPOT",
                 working_time_limit_minutes=default_working_time_limit,
                 working_time_remaining_minutes=default_working_time_limit,
                 updated_by=actor,
@@ -979,7 +979,7 @@ def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
             # trip, so multi-trip MTs display the matching Trip 1/2/... return.
             "system_eta_depot": _iso(displayed_system_eta(row.mt_id)),
             "effective_eta_depot": _iso(row.planned_eta_depot or row.system_eta_depot),
-            "operational_status": row.operational_status,
+            "operational_status": "READY_SIOD" if row.operational_status == "READY" else row.operational_status,
             "delivery_status": delivery_status(row.mt_id),
             "working_time_used": row.working_time_used_minutes,
             "working_time_remaining": row.working_time_remaining_minutes,
@@ -1017,7 +1017,9 @@ def update_vehicle_states(db: Session, job_id: str, updates: list[dict], *, acto
         if "planned_eta_depot" in update:
             row.planned_eta_depot = datetime.fromisoformat(str(update["planned_eta_depot"]).replace("Z", "+00:00")) if update["planned_eta_depot"] else None
         if "operational_status" in update:
-            status = str(update["operational_status"]).upper()
+            status = str(update["operational_status"]).strip().upper().replace(" ", "_")
+            if status == "READY":
+                status = "READY_SIOD"
             if status not in MT_STATUSES:
                 raise HTTPException(status_code=400, detail={"code": "INVALID_MT_STATUS", "message": f"Unsupported MT status: {status}."})
             row.operational_status = status
@@ -1718,7 +1720,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             "effective_eta_depot": _utc(row.planned_eta_depot),
             "optimization_reference_time": _utc(current_time),
             "depot_operational_start": operational_start,
-            "operational_status": row.operational_status,
+            "operational_status": "READY_SIOD" if row.operational_status == "READY" else row.operational_status,
             "working_time_limit_minutes": row.working_time_limit_minutes,
             "working_time_used_minutes": row.working_time_used_minutes,
             "working_time_remaining_minutes": row.working_time_remaining_minutes,

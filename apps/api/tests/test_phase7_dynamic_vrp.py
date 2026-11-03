@@ -590,6 +590,92 @@ def loading_order(lo_id: str, spbu_id: str, *, product_id: str = "P1", allowed=N
     }
 
 
+@pytest.mark.parametrize("count,capacity,expected_trips", [(3, 24, 1), (2, 24, 0), (2, 16, 1), (7, 24, 2)])
+def test_full_load_is_required_on_every_used_trip(count, capacity, expected_trips) -> None:
+    orders = [loading_order(f"LO-{index}", f"S{index}") for index in range(count)]
+    matrix = [[0 if i == j else 300 for j in range(count + 1)] for i in range(count + 1)]
+    result = VRPOptimizationService().solve(
+        loading_orders=orders, vehicles=[vehicle("M1", capacity=capacity, compartments=capacity // 8)],
+        distance_matrix=matrix, time_matrix=matrix, day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(route_optimization_time_limit=4, refueling_minutes=0),
+    )
+    assert len(result["trips"]) == expected_trips
+    assert all(sum(lo["volume_kl"] for lo in trip["lo_assignments"]) == capacity for trip in result["trips"])
+    assert len(result["dropped"]) == count - expected_trips * (capacity // 8)
+    if result["dropped"]:
+        assert all(row["reason_code"] == "FULL_LOAD_NOT_MET" for row in result["dropped"])
+
+
+@pytest.mark.parametrize("mode,enabled", [("SOFT", True), ("HARD", False)])
+def test_full_load_can_be_soft_or_disabled(mode, enabled) -> None:
+    result = VRPOptimizationService().solve(
+        loading_orders=[loading_order("LO-1", "S1"), loading_order("LO-2", "S2")],
+        vehicles=[vehicle("M1", capacity=24, compartments=3), vehicle("M2", capacity=24, compartments=3)],
+        distance_matrix=[[0, 300, 300], [300, 0, 300], [300, 300, 0]],
+        time_matrix=[[0, 300, 300], [300, 0, 300], [300, 300, 0]],
+        day_start=DAY_START, depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(**constraint_override("vehicle_full_load", mode=mode, enabled=enabled, penalty=1000)),
+    )
+    assert len(result["trips"]) == 1
+    violations = [row for row in result["trips"][0]["constraint_violations"] if row["constraint_id"] == "vehicle_full_load"]
+    assert len(violations) == (1 if enabled else 0)
+    if violations:
+        assert violations[0]["penalty"] == 1000
+
+
+def test_full_load_defaults_to_hard_for_existing_profiles() -> None:
+    assert constraint_is_hard(effective_parameters({"constraint_rules": {"vehicle_capacity": {"enabled": True, "mode": "HARD"}}}), "vehicle_full_load")
+
+
+def test_full_load_selects_smaller_mt_instead_of_partial_preferred_mt() -> None:
+    orders = [loading_order(f"LO-{index}", f"S{index}", allowed=["M1", "M2"]) for index in range(2)]
+    matrix = [[0, 300, 300], [300, 0, 300], [300, 300, 0]]
+    result = VRPOptimizationService().solve(
+        loading_orders=orders,
+        vehicles=[vehicle("M1", capacity=24, compartments=3), vehicle("M2", capacity=16, compartments=2)],
+        distance_matrix=matrix, time_matrix=matrix, day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18), parameters=parameters(),
+    )
+    assert not result["dropped"]
+    assert len(result["trips"]) == 1
+    assert result["trips"][0]["vehicle_id"] == "M2"
+
+
+def test_post_bay_validation_rejects_partial_trip_even_if_route_solver_returns_it() -> None:
+    dropped, reasons, retryable = OptimizationCoordinatorService._post_bay_failures(
+        trips=[{"vehicle_id": "M1", "trip_number": 1, "lo_assignments": [{"volume_kl": 8}, {"volume_kl": 8}]}],
+        bay_result={}, vehicles=[{**vehicle("M1", capacity=24, compartments=3), "working_time_limit_minutes": 600}],
+        parameters=parameters(), day_start=DAY_START,
+    )
+    assert dropped == retryable == {0}
+    assert reasons[0][0] == "FULL_LOAD_NOT_MET"
+
+
+@pytest.mark.parametrize("counts,mt_count", [([2] * 4, 4), ([1, 1, 2, 4, 4, 4, 4, 4, 4, 5, 6, 6, 7, 8, 8, 10, 10], 27)])
+def test_full_load_cold_start_with_hard_historical_pairing_serves_feasible_pairs(counts, mt_count) -> None:
+    # Each SPBU has two 8 KL LO. Cross-SPBU history is absent, so HARD
+    # pairing allows only the same-SPBU pair to fill a 16 KL vehicle.
+    # The larger case reproduced an all-dropped solution with insertion search.
+    mts = [f"M{i}" for i in range(mt_count)]
+    orders = [loading_order(f"LO-{s}-{i}", f"S{s}", allowed=mts, preferred=None) for s, count in enumerate(counts) for i in range(count)]
+    size = len(orders) + 1
+    matrix = [[0 if i == j or (i and j and orders[i - 1]["spbu_id"] == orders[j - 1]["spbu_id"]) else 80_000 for j in range(size)] for i in range(size)]
+    result = VRPOptimizationService().solve(
+        loading_orders=orders, vehicles=[vehicle(mt, capacity=16, compartments=2) for mt in mts],
+        distance_matrix=matrix, time_matrix=matrix, day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(route_warm_start_source="CURRENT_ROUTE", maximum_trips_per_mt=1,
+                              route_optimization_time_limit=4, objective="MIN_TOTAL_OPERATING_TIME",
+                              travel_time_mode="MANUAL_SPEED", average_speed_kmh=35,
+                              **constraint_override("historical_pairing_preference", mode="HARD")),
+    )
+    expected_trips = min(sum(count // 2 for count in counts), mt_count)
+    assert len(result["trips"]) == expected_trips
+    assert len(result["dropped"]) == len(orders) - 2 * expected_trips
+    assert all(sum(lo["volume_kl"] for lo in trip["lo_assignments"]) == 16 for trip in result["trips"])
+
+
 def test_a_phase6_warm_start_is_soft_and_can_reassign_when_preferred_mt_is_too_late() -> None:
     lo = loading_order("LO-1", "S1", allowed=["M1", "M2"], preferred="M1")
     lo.update({"time_window_start_minutes": 300, "time_window_end_minutes": 420})
@@ -796,13 +882,13 @@ def test_vehicle_capacity_can_be_soft_or_disabled() -> None:
     }
     soft = VRPOptimizationService().solve(
         **common,
-        parameters=parameters(maximum_trips_per_mt=1, **constraint_override("vehicle_capacity", mode="SOFT", penalty=1_000)),
+        parameters=parameters(maximum_trips_per_mt=1, constraint_rules={"vehicle_capacity": {"mode": "SOFT", "penalty": 1000}, "vehicle_full_load": {"enabled": False}}),
     )
     assert len(soft["trips"][0]["lo_assignments"]) == 2
     assert any(row["constraint_id"] == "vehicle_capacity" for row in soft["trips"][0]["constraint_violations"])
     disabled = VRPOptimizationService().solve(
         **common,
-        parameters=parameters(maximum_trips_per_mt=1, **constraint_override("vehicle_capacity", enabled=False, penalty=1_000)),
+        parameters=parameters(maximum_trips_per_mt=1, constraint_rules={"vehicle_capacity": {"enabled": False}, "vehicle_full_load": {"enabled": False}}),
     )
     assert len(disabled["trips"][0]["lo_assignments"]) == 2
     assert not any(row["constraint_id"] == "vehicle_capacity" for row in disabled["trips"][0]["constraint_violations"])
@@ -1348,8 +1434,8 @@ def test_coordinator_persists_partial_bay_window_exhaustion_instead_of_product_f
     result = coordinator.optimize(
         loading_orders=[],
         vehicles=[
-            {"mt_id": "MT-1", "working_time_limit_minutes": 600, "working_time_used_minutes": 0},
-            {"mt_id": "MT-2", "working_time_limit_minutes": 600, "working_time_used_minutes": 0},
+            {"mt_id": "MT-1", "working_time_limit_minutes": 600, "working_time_used_minutes": 0, "capacity_kl": 8},
+            {"mt_id": "MT-2", "working_time_limit_minutes": 600, "working_time_used_minutes": 0, "capacity_kl": 8},
         ],
         distance_matrix=[[0]],
         time_matrix=[[0]],
@@ -1408,7 +1494,7 @@ def test_coordinator_keeps_trip_that_gates_out_before_close_and_returns_after(mo
 
     result = coordinator.optimize(
         loading_orders=[],
-        vehicles=[{"mt_id": "MT-1", "working_time_limit_minutes": 600, "working_time_used_minutes": 0}],
+        vehicles=[{"mt_id": "MT-1", "working_time_limit_minutes": 600, "working_time_used_minutes": 0, "capacity_kl": 8}],
         distance_matrix=[[0]],
         time_matrix=[[0]],
         bays=[{
@@ -1556,8 +1642,8 @@ def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_st
     result = coordinator.optimize(
         loading_orders=[failed_lo, retained_lo],
         vehicles=[
-            {"mt_id": "MT-1", "working_time_limit_minutes": 70, "working_time_used_minutes": 0},
-            {"mt_id": "MT-2", "working_time_limit_minutes": 100, "working_time_used_minutes": 0},
+            {"mt_id": "MT-1", "working_time_limit_minutes": 70, "working_time_used_minutes": 0, "capacity_kl": 8},
+            {"mt_id": "MT-2", "working_time_limit_minutes": 100, "working_time_used_minutes": 0, "capacity_kl": 8},
         ],
         distance_matrix=[[0, 1, 1], [1, 0, 1], [1, 1, 0]],
         time_matrix=[[0, 60, 60], [60, 0, 60], [60, 60, 0]],
@@ -1582,8 +1668,10 @@ def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_st
     assert result["solver_metadata"]["post_bay_reassignment_exhausted_lo_count"] == 0
 
 
+@pytest.mark.parametrize("repair_capacity", [8, 24])
 def test_coordinator_reassigns_bay_window_failure_to_unused_compatible_mt(
     monkeypatch: pytest.MonkeyPatch,
+    repair_capacity: int,
 ) -> None:
     loading_order = {
         "loading_order_id": "LO-BAY-RETRY",
@@ -1648,7 +1736,7 @@ def test_coordinator_reassigns_bay_window_failure_to_unused_compatible_mt(
         loading_orders=[loading_order],
         vehicles=[
             {**vehicle_defaults, "mt_id": "MT-LATE", "effective_eta_depot": DAY_START + timedelta(hours=17, minutes=50)},
-            {**vehicle_defaults, "mt_id": "MT-UNUSED", "effective_eta_depot": DAY_START},
+            {**vehicle_defaults, "mt_id": "MT-UNUSED", "capacity_kl": repair_capacity, "effective_eta_depot": DAY_START},
         ],
         distance_matrix=[[0, 1], [1, 0]],
         time_matrix=[[0, 60], [60, 0]],
@@ -1669,6 +1757,12 @@ def test_coordinator_reassigns_bay_window_failure_to_unused_compatible_mt(
         parameters=parameters(route_optimization_time_limit=10, bay_optimization_time_limit=10),
     )
 
+    if repair_capacity == 24:
+        assert solve_calls == 1  # Reject partial-load repair before calling the solver.
+        assert result["trips"] == []
+        assert result["dropped"][0]["reason_code"] == "FULL_LOAD_NOT_MET"
+        assert result["solver_metadata"]["post_bay_candidate_audit"][-1]["reason_code"] == "FULL_LOAD_NOT_MET"
+        return
     assert solve_calls == 2
     assert result["solver_status"] == "FEASIBLE"
     assert result["dropped"] == []
@@ -1755,8 +1849,8 @@ def test_coordinator_drops_post_bay_lo_only_after_all_alternative_mt_are_exhaust
     result = coordinator.optimize(
         loading_orders=[loading_order],
         vehicles=[
-            {"mt_id": "MT-1", "working_time_limit_minutes": 70, "working_time_used_minutes": 0},
-            {"mt_id": "MT-2", "working_time_limit_minutes": 70, "working_time_used_minutes": 0},
+            {"mt_id": "MT-1", "working_time_limit_minutes": 70, "working_time_used_minutes": 0, "capacity_kl": 8},
+            {"mt_id": "MT-2", "working_time_limit_minutes": 70, "working_time_used_minutes": 0, "capacity_kl": 8},
         ],
         distance_matrix=[[0, 1], [1, 0]],
         time_matrix=[[0, 60], [60, 0]],
@@ -2708,3 +2802,44 @@ def test_y_reroute_date_is_locked_and_time_cannot_move_backwards() -> None:
         latest_reference_time=latest_reference,
     )
     assert accepted == datetime(2026, 8, 26, 4, 30, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("status", ["PARKING_DEPOT", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING"])
+def test_ready_siod_preferred_over_other_available_statuses(monkeypatch, fallback, status):
+    if fallback:
+        monkeypatch.setattr(phase7_optimization, "ORTOOLS_AVAILABLE", False)
+    parking = {**vehicle("M1"), "operational_status": status}
+    ready = {**vehicle("M2"), "operational_status": "READY_SIOD"}
+    result = VRPOptimizationService().solve(
+        loading_orders=[loading_order("LO-1", "S1", allowed=["M1", "M2"], preferred="M1")],
+        vehicles=[parking, ready], distance_matrix=[[0, 300], [300, 0]],
+        time_matrix=[[0, 300], [300, 0]], day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(route_optimization_time_limit=1, refueling_minutes=0),
+    )
+    assert len(result["trips"]) == 1
+    assert result["trips"][0]["vehicle_id"] == "M2"
+
+
+@pytest.mark.parametrize("status", ["PARKING_DEPOT", "ON_TRIP", "RETURNING"])
+def test_other_status_remains_eligible_when_ready_siod_incompatible(status):
+    result = VRPOptimizationService().solve(
+        loading_orders=[loading_order("LO-1", "S1", allowed=["M1"])],
+        vehicles=[{**vehicle("M1", eta_hour=10), "operational_status": status},
+                  {**vehicle("M2"), "operational_status": "READY_SIOD"}],
+        distance_matrix=[[0, 300], [300, 0]], time_matrix=[[0, 300], [300, 0]],
+        day_start=DAY_START, depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(route_optimization_time_limit=1, refueling_minutes=0),
+    )
+    assert result["trips"][0]["vehicle_id"] == "M1"
+    assert result["trips"][0]["vehicle_ready_at_depot"] >= DAY_START + timedelta(hours=10)
+
+
+def test_readiness_priority_consumed_by_retained_trip():
+    ready = {**vehicle("M1"), "operational_status": "READY_SIOD", "working_time_limit_minutes": 600}
+    retained = [{"vehicle_id": "M1", "trip_number": 1, "operating_minutes": 60,
+                 "estimated_return_depot": DAY_START + timedelta(hours=8)}]
+    updated = OptimizationCoordinatorService._vehicles_after_retained_trips([ready], retained)[0]
+    assert not VRPOptimizationService._ready_siod_pending(updated)
+    assert VRPOptimizationService._ready_siod_pending(ready)

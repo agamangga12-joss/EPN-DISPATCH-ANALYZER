@@ -1423,7 +1423,7 @@ class VehicleOperationalState(Base):
     system_eta_depot = mapped_column(DateTime(timezone=True), nullable=True)
     user_eta_override = mapped_column(DateTime(timezone=True), nullable=True)
     effective_eta_depot = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    operational_status: Mapped[str] = mapped_column(String(30), default="READY")
+    operational_status: Mapped[str] = mapped_column(String(30), default="PARKING_DEPOT")
     working_time_limit_minutes: Mapped[int] = mapped_column(Integer, default=720)
     working_time_used_minutes: Mapped[int] = mapped_column(Integer, default=0)
     working_time_remaining_minutes: Mapped[int] = mapped_column(Integer, default=720)

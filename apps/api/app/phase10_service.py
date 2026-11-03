@@ -251,7 +251,7 @@ def vehicle_record(row: MasterMT, tags: list[str], state: VehicleOperationalStat
     raw_status = (state.operational_status if state else "UNKNOWN").upper()
     if not active or raw_status in {"UNAVAILABLE", "MAINTENANCE", "OUT_OF_SERVICE", "INACTIVE"}:
         operational_status = "UNAVAILABLE"
-    elif state and raw_status in {"AVAILABLE", "READY", "IDLE"}:
+    elif state and raw_status in {"AVAILABLE", "READY", "READY_SIOD", "IDLE"}:
         operational_status = "AVAILABLE"
     else:
         operational_status = "UNKNOWN"

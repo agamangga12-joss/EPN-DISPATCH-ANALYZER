@@ -182,6 +182,19 @@ class VRPOptimizationService:
     def __init__(self) -> None:
         self.compartments = CompartmentAssignmentService()
 
+    # Solver preference only; never included in reported financial activation costs.
+    READY_SIOD_PRIORITY = 100_000
+
+    @staticmethod
+    def _ready_siod_pending(vehicle: dict) -> bool:
+        return vehicle.get("operational_status") in {"READY_SIOD", "READY"} and not vehicle.get("ready_siod_assigned", False)
+
+    @classmethod
+    def _readiness_cost(cls, vehicle: dict, vehicles: list[dict]) -> int:
+        if any(cls._ready_siod_pending(row) for row in vehicles) and not cls._ready_siod_pending(vehicle):
+            return cls.READY_SIOD_PRIORITY
+        return 0
+
     @staticmethod
     def _vehicle_cost(parameters: dict, vehicle: dict) -> int:
         rules = sorted(
@@ -204,7 +217,7 @@ class VRPOptimizationService:
     ) -> tuple[list[dict], set[int], str, float]:
         routes: list[dict] = []
         served: set[int] = set()
-        for vehicle_index, vehicle in enumerate(vehicles):
+        for vehicle_index, vehicle in sorted(enumerate(vehicles), key=lambda item: not VRPOptimizationService._ready_siod_pending(item[1])):
             capacity = float(vehicle["capacity_kl"])
             allowed = [
                 index for index, row in enumerate(remaining, start=1)
@@ -377,6 +390,25 @@ class VRPOptimizationService:
             "Capacity",
         )
         capacity_dimension = routing.GetDimensionOrDie("Capacity")
+        # End cumul includes the final LO demand. An unused vehicle has zero
+        # demand and must remain legal even when there is insufficient volume.
+        full_load_soft = constraint_is_soft(parameters, "vehicle_full_load")
+        if full_load_soft:
+            zero_index = routing.RegisterUnaryTransitCallback(lambda index: 0)
+            routing.AddDimension(zero_index, 1, 1, True, "FullLoadViolation")
+            full_load_dimension = routing.GetDimensionOrDie("FullLoadViolation")
+        for vehicle_index, vehicle in enumerate(vehicles):
+            end = routing.End(vehicle_index)
+            target = round(float(vehicle["capacity_kl"]) * demand_scale)
+            used = routing.ActiveVehicleVar(vehicle_index)
+            if constraint_is_hard(parameters, "vehicle_full_load"):
+                routing.solver().Add(capacity_dimension.CumulVar(end) == target * used)
+            elif full_load_soft:
+                mismatch = routing.solver().IsDifferentCstVar(capacity_dimension.CumulVar(end), target)
+                routing.solver().Add(full_load_dimension.CumulVar(end) >= mismatch + used - 1)
+                full_load_dimension.SetCumulVarSoftUpperBound(
+                    end, 0, constraint_penalty(parameters, "vehicle_full_load")
+                )
 
         if service_minutes and constraint_is_hard(parameters, "spbu_no_overlap"):
             cp = routing.solver()
@@ -450,7 +482,7 @@ class VRPOptimizationService:
 
             cost_index = routing.RegisterTransitCallback(cost_callback)
             routing.SetArcCostEvaluatorOfVehicle(cost_index, vehicle_index)
-            routing.SetFixedCostOfVehicle(self._vehicle_cost(parameters, vehicle), vehicle_index)
+            routing.SetFixedCostOfVehicle(self._vehicle_cost(parameters, vehicle) + self._readiness_cost(vehicle, vehicles), vehicle_index)
             if use_elapsed_cost and objective != "MIN_TOTAL_DISTANCE":
                 # Charge elapsed route time once, including fuel, breaks and
                 # service. Drive-time costs are removed from the arc evaluator.
@@ -609,7 +641,15 @@ class VRPOptimizationService:
                         routing.NextVar(source_index).RemoveValue(manager.NodeToIndex(target_node))
 
         search = pywrapcp.DefaultRoutingSearchParameters()
-        search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+        # With exact-load end constraints and HARD pairing, insertion search
+        # can settle on the legal all-unperformed solution: individual inserts
+        # cannot activate a partially filled vehicle. Build a complete path
+        # instead, so full compatible groups can be formed from a cold start.
+        search.first_solution_strategy = (
+            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+            if constraint_is_hard(parameters, "vehicle_full_load")
+            else routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+        )
         search.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
         search.time_limit.FromSeconds(
             int(parameters.get("route_round_time_limit", parameters.get("route_optimization_time_limit", 30)))
@@ -696,6 +736,13 @@ class VRPOptimizationService:
             active_vehicles = [
                 row for row in vehicle_state.values()
                 if (row.get("operational_status") != "UNAVAILABLE" or not constraint_is_hard(parameters, "vehicle_availability"))
+                and (
+                    not constraint_is_hard(parameters, "vehicle_full_load")
+                    or sum(
+                        float(lo["volume_kl"]) for lo in remaining
+                        if row["mt_id"] in (lo.get("allowed_vehicle_ids") or [])
+                    ) >= float(row["capacity_kl"]) - 1e-6
+                )
                 and row.get("effective_eta_depot") is not None
                 and (
                     _utc(row["effective_eta_depot"]) < _utc(depot_close)
@@ -740,6 +787,10 @@ class VRPOptimizationService:
             for raw_route in raw_routes:
                 vehicle = active_vehicles[raw_route["vehicle_index"]]
                 route_los = [remaining[node - 1] for node in raw_route["node_indices"]]
+                if constraint_is_hard(parameters, "vehicle_full_load") and abs(
+                    sum(float(lo["volume_kl"]) for lo in route_los) - float(vehicle["capacity_kl"])
+                ) > 1e-6:
+                    continue
                 compartment_seconds = max(1, min(5, math.ceil(solve_deadline - perf_counter())))
                 compartment_result = self.compartments.assign(
                     route_los, vehicle.get("compartments") or [], parameters=parameters, time_limit_seconds=compartment_seconds
@@ -804,6 +855,8 @@ class VRPOptimizationService:
                     continue
                 constraint_violations = list(compartment_result.get("constraint_violations") or [])
                 selected_volume = sum(float(lo["volume_kl"]) for lo in route_los)
+                if abs(selected_volume - float(vehicle["capacity_kl"])) > 1e-6 and constraint_is_soft(parameters, "vehicle_full_load"):
+                    constraint_violations.append({"constraint_id": "vehicle_full_load", "penalty": constraint_penalty(parameters, "vehicle_full_load"), "entity": vehicle["mt_id"]})
                 if selected_volume > float(vehicle["capacity_kl"]) + 1e-9 and constraint_is_soft(parameters, "vehicle_capacity"):
                     constraint_violations.append({"constraint_id": "vehicle_capacity", "penalty": constraint_penalty(parameters, "vehicle_capacity"), "entity": vehicle["mt_id"]})
                 if ready < _utc(vehicle.get("availability_eta_depot") or vehicle["effective_eta_depot"]) and constraint_is_soft(parameters, "vehicle_availability"):
@@ -875,6 +928,7 @@ class VRPOptimizationService:
                 state["effective_eta_depot"] = next_vehicle_ready_at_depot
                 state["availability_eta_depot"] = next_vehicle_ready_at_depot
                 state["completed_trip_count"] = trip_number
+                state["ready_siod_assigned"] = True
                 state["working_time_used_minutes"] = int(state.get("working_time_used_minutes") or 0) + operating_minutes
                 state["working_time_remaining_minutes"] = int(state.get("working_time_remaining_minutes") or 0) - operating_minutes
             if not accepted_ids:
@@ -898,9 +952,16 @@ class VRPOptimizationService:
             elif all(_utc(vehicle_state[mt_id]["effective_eta_depot"]) >= _utc(depot_close) for mt_id in lo["allowed_vehicle_ids"] if mt_id in vehicle_state):
                 code = "DEPOT_TIME_EXHAUSTED"
                 description = "All compatible MT become available after the depot gate-out operating limit."
+            elif constraint_is_hard(parameters, "vehicle_full_load") and all(
+                sum(float(row["volume_kl"]) for row in remaining if mt_id in (row.get("allowed_vehicle_ids") or []))
+                < float(vehicle_state[mt_id]["capacity_kl"]) - 1e-6
+                for mt_id in lo["allowed_vehicle_ids"] if mt_id in vehicle_state
+            ):
+                code = "FULL_LOAD_NOT_MET"
+                description = "Remaining compatible LO volume is insufficient to fill any compatible MT trip."
             else:
                 code = "NO_FEASIBLE_ROUTE"
-                description = "No route satisfies the remaining capacity, working-time, time-window, and depot constraints."
+                description = "No route satisfies the remaining capacity, full-load, working-time, time-window, and depot constraints."
             dropped.append({**lo, "reason_code": code, "reason_description": description})
         if trips and dropped:
             final_status = "PARTIAL"
@@ -1862,6 +1923,7 @@ class OptimizationCoordinatorService:
         }
         tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
         working_limit = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
+        vehicle_capacity = {row["mt_id"]: float(row["capacity_kl"]) for row in vehicles}
         cumulative_working = {row["mt_id"]: int(row.get("working_time_used_minutes") or 0) for row in vehicles}
         ordered_indexes = sorted(
             range(len(trips)),
@@ -1872,6 +1934,13 @@ class OptimizationCoordinatorService:
             if trip_index in dropped:
                 continue
             vehicle_id = trip["vehicle_id"]
+            if constraint_is_hard(parameters, "vehicle_full_load") and abs(
+                sum(float(lo["volume_kl"]) for lo in trip.get("lo_assignments") or []) - vehicle_capacity[vehicle_id]
+            ) > 1e-6:
+                dropped.add(trip_index)
+                retryable_failures.add(trip_index)
+                reasons[trip_index] = ("FULL_LOAD_NOT_MET", "Trip volume must equal the assigned MT capacity.")
+                continue
             projected = cumulative_working.get(vehicle_id, 0) + int(trip["operating_minutes"])
             if projected > working_limit.get(vehicle_id, 0):
                 if constraint_is_hard(parameters, "vehicle_working_time"):
@@ -1950,6 +2019,7 @@ class OptimizationCoordinatorService:
                 [int(source.get("completed_trip_count") or 0), *[int(trip["trip_number"]) for trip in retained]],
             )
             if retained:
+                vehicle["ready_siod_assigned"] = True
                 latest_return = max(_utc(trip["estimated_return_depot"]) for trip in retained)
                 vehicle["availability_eta_depot"] = latest_return
                 vehicle["effective_eta_depot"] = latest_return
@@ -1992,6 +2062,12 @@ class OptimizationCoordinatorService:
                     vehicle = next(v for v in vehicles if v["mt_id"] == trip["vehicle_id"])
                     cost += VRPOptimizationService._vehicle_cost(parameters, vehicle)
                     activation.add(trip["vehicle_id"])
+        # Reward dispatching each already-ready physical MT once across all trips.
+        used_ids = {trip["vehicle_id"] for trip in result.get("trips", [])}
+        cost -= VRPOptimizationService.READY_SIOD_PRIORITY * sum(
+            VRPOptimizationService._ready_siod_pending(vehicle) and vehicle["mt_id"] in used_ids
+            for vehicle in vehicles
+        )
         return cost
 
     def optimize(self, **kwargs):
@@ -2211,6 +2287,13 @@ class OptimizationCoordinatorService:
                     "status": "REJECTED",
                     "reason_code": None,
                 }
+                if constraint_is_hard(parameters, "vehicle_full_load") and abs(
+                    sum(float(order["volume_kl"]) for order in retry_orders) - float(candidate["capacity_kl"])
+                ) > 1e-6:
+                    audit["reason_code"] = "FULL_LOAD_NOT_MET"
+                    group_candidate_reasons.append("FULL_LOAD_NOT_MET")
+                    post_bay_candidate_audit.append(audit)
+                    continue
                 if (
                     constraint_is_hard(parameters, "vehicle_capacity")
                     and candidate.get("capacity_kl") is not None
@@ -2386,6 +2469,10 @@ class OptimizationCoordinatorService:
             elif group_candidate_reasons and all(reason == "VEHICLE_TIME_EXHAUSTED" for reason in group_candidate_reasons):
                 final_reason_code = "VEHICLE_TIME_EXHAUSTED"
                 final_description = "Every compatible alternative MT failed its actual retained working-time limit after FIFO bay scheduling."
+                post_bay_reassignment_exhausted_lo_ids.update(group_ids)
+            elif group_candidate_reasons and all(reason == "FULL_LOAD_NOT_MET" for reason in group_candidate_reasons):
+                final_reason_code = "FULL_LOAD_NOT_MET"
+                final_description = "No remaining compatible alternative MT has exactly the repair group's volume."
                 post_bay_reassignment_exhausted_lo_ids.update(group_ids)
             elif "BAY_WINDOW_EXHAUSTED" in group_candidate_reasons:
                 final_reason_code = "BAY_WINDOW_EXHAUSTED"

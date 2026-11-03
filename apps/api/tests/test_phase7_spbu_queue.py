@@ -103,6 +103,9 @@ def test_routing_engine_changes_mt_allocation_to_satisfy_spbu_capacity():
             {"loading_order_id":"A2","spbu_id":"A","product_id":"P","volume_kl":8,"allowed_vehicle_ids":["M1","M2"],"phase6_predicted_vehicle_id":"M2","time_window_start_minutes":10,"time_window_end_minutes":20},
             {"loading_order_id":"B","spbu_id":"B","product_id":"P","volume_kl":8,"allowed_vehicle_ids":["M1","M2"],"phase6_predicted_vehicle_id":"M1","time_window_start_minutes":0,"time_window_end_minutes":1440}]
     vehicles=[{"mt_id":m,"capacity_kl":16,"compartments":[{"compartment_id":"C1","capacity_kl":8},{"compartment_id":"C2","capacity_kl":8}],"effective_eta_depot":DAY,"working_time_remaining_minutes":720} for m in ["M1","M2"]]
+    # 24 KL can fill one 16 KL trip and one 8 KL trip.
+    vehicles[1]["capacity_kl"] = 8
+    vehicles[1]["compartments"] = [{"compartment_id": "C1", "capacity_kl": 8}]
     d=[[0,10000,10000,10000],[10000,0,0,1000],[10000,0,0,1000],[10000,1000,1000,0]]
     times=[[0,600,600,600],[600,0,0,60],[600,0,0,60],[600,60,60,0]]
     common={"loading_orders":orders,"vehicles":vehicles,"distance_matrix":d,"time_matrix":times,"day_start":DAY,"depot_close":DAY+timedelta(hours=20)}

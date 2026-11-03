@@ -109,6 +109,32 @@ The next trip is eligible only when its loading/gate-out can occur before depot 
 
 ## Compartment assignment
 
+### Full load per trip
+
+Constraint `vehicle_full_load` (**Full Load per Trip**) defaults to enabled / HARD,
+including when an existing parameter profile is normalized. Every newly planned
+trip must carry exactly the assigned MT's `capacity_kl`; unused vehicles remain
+allowed. For example, a 24 KL MT can carry three 8 KL LO, but cannot depart with
+only two. The rule applies independently to every multi-trip round, Initial
+Optimization, Re-Optimize, and post-bay repair. A smaller compatible MT may serve
+the remaining LO when its capacity matches their volume.
+
+The Routing capacity end cumul enforces full load before route selection. Repair
+candidates use the same rule. When full load is HARD, the initial routing
+strategy is PATH_CHEAPEST_ARC: insertion search can otherwise settle on an empty
+plan when full loads must also satisfy HARD historical pairing. Other modes
+retain PARALLEL_CHEAPEST_INSERTION. Final post-bay validation also enforces full load. Insufficient
+remaining compatible LO volume, or a repair candidate whose capacity does not
+match the group, is reported as `FULL_LOAD_NOT_MET`. Other routing or timing
+failures retain their own reason codes. Compartment/product feasibility remains
+an independent check.
+
+SOFT mode permits a non-full trip with one configured penalty per trip; disabled
+mode permits partial loads without that penalty. HARD full load still requires
+exact capacity even if the separate vehicle-capacity constraint is softened or
+disabled. Existing immutable versions and copied ONGOING/DONE trips are retained;
+run Re-Optimize to apply this rule to future work. No database migration is needed.
+
 CP-SAT creates binary `LO × compartment` assignment variables and `compartment × product` activation variables.
 
 Hard constraints:
@@ -492,3 +518,11 @@ Aturan waktu:
 Antrean dan offset mulai bongkar disimpan dalam JSON `trip_timing.spbu_visits`, diekspos sebagai `spbu_queue_seconds` dan `unloading_start_time` di stop Route Details. Durasi pelayanan tersimpan hanya mencakup bongkar, tidak mencampur antrean. Gantt menampilkan **Antre SPBU** terpisah dari perjalanan dan pelayanan. Rute lama tanpa metadata baru tetap dapat dibaca.
 
 Tidak ada migrasi database, service Docker, atau paket tambahan. Profile lama mendapat default constraint baru ketika dinormalisasi; gunakan Re-Optimize untuk menghasilkan versi rute yang mempertimbangkannya. Installer yang ada tetap membangun source terbaru secara otomatis.
+
+
+### MT operational readiness
+
+Operational cycle: PARKING_DEPOT ? READY_SIOD ? QUEUEING ? LOADING ? ON_TRIP ? RETURNING ? PARKING_DEPOT.
+Newly loaded MT starts as PARKING_DEPOT. READY_SIOD means vehicle checks and AMT assignment are complete; the dispatcher updates this status manually. Other available statuses remain eligible for future shipments using Planned ETA Depot and all existing constraints. UNAVAILABLE follows the MT Availability constraint.
+
+The routing objective applies a 100,000-point preference for dispatching READY_SIOD vehicles, and coordination scoring rewards each ready physical MT used once. This is a soft preference, so feasibility, frozen assignments and the overall objective can outweigh it. It does not change reported financial activation costs. The preference is consumed after the first accepted trip within a solve; it does not repeatedly prioritize that MT on later trips. Stored operational status remains dispatcher-controlled. Legacy READY inputs are accepted as READY_SIOD; migration 0035 converts stored READY values. Excel and API also accept labels with spaces.
