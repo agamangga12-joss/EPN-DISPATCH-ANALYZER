@@ -85,17 +85,19 @@ def schedule_spbu(trips, bay_result, bays, parameters, day_start, depot_close, d
             wait=model.new_int_var(0,horizon,f"wait_{index}_{seq}")
             model.add(wait == start-arrival).only_enforce_if(on)
             model.add(wait == 0).only_enforce_if(on.Not())
-            if constraint_is_hard(parameters,"spbu_time_window"):
-                if order.get("time_window_start_minutes") is not None:
-                    model.add(start >= int(order["time_window_start_minutes"])*60).only_enforce_if(on)
-                if order.get("time_window_end_minutes") is not None:
-                    model.add(start <= int(order["time_window_end_minutes"])*60).only_enforce_if(on)
-            elif constraint_is_soft(parameters,"spbu_time_window"):
-                for boundary,sign in [(order.get("time_window_start_minutes"),-1),(order.get("time_window_end_minutes"),1)]:
-                    if boundary is not None:
-                        violation=model.new_bool_var(f"window_{index}_{seq}_{sign}")
-                        model.add(sign*(start-int(boundary)*60) <= 0).only_enforce_if([on,violation.Not()])
-                        objective.append(violation*constraint_penalty(parameters,"spbu_time_window"))
+            for receiving_index, receiving_order in enumerate(stop.get("loading_orders") or [order]):
+                if constraint_is_hard(parameters,"spbu_time_window"):
+                    if receiving_order.get("time_window_start_minutes") is not None:
+                        model.add(start >= int(receiving_order["time_window_start_minutes"])*60).only_enforce_if(on)
+                    if receiving_order.get("time_window_end_minutes") is not None:
+                        model.add(start <= int(receiving_order["time_window_end_minutes"])*60).only_enforce_if(on)
+                elif constraint_is_soft(parameters,"spbu_time_window"):
+                    outside = model.new_bool_var(f"window_{index}_{seq}_{receiving_index}")
+                    for boundary,sign in [(receiving_order.get("time_window_start_minutes"),-1),(receiving_order.get("time_window_end_minutes"),1)]:
+                        if boundary is not None:
+                            model.add(sign*(start-int(boundary)*60) <= 0).only_enforce_if([on,outside.Not()])
+                    model.add(outside <= on)
+                    objective.append(outside*constraint_penalty(parameters,"spbu_time_window"))
             resource=str(order["spbu_id"])
             interval=model.new_optional_interval_var(start,service,end,on,f"spbu_{index}_{seq}")
             by_spbu[resource].append(interval)
@@ -193,9 +195,13 @@ def schedule_spbu(trips, bay_result, bays, parameters, day_start, depot_close, d
         trip["physical_vehicle_ready_at_depot"]=actual_ready[index]
         assignment["queue_start"]=assignment["loading_start"]
         assignment["queue_minutes"]=0
-        trip.update(assignment)
+        # Schedule updates must preserve the route and compartment penalties.
+        trip.update({key: value for key, value in assignment.items() if key != "constraint_violations"})
         trip["constraint_violations"]=[row for row in trip.get("constraint_violations",[]) if row.get("constraint_id") not in {"spbu_no_overlap","spbu_time_window","bay_no_overlap","bay_operating_window","depot_operating_window"}]
         bay=bay_map.get(assignment["master_bay_id"],{})
+        for constraint_id, opening in [("depot_operating_window", 0), ("bay_operating_window", int(bay.get("operational_start_minutes") or 0)*60)]:
+            if constraint_is_soft(parameters, constraint_id) and seconds(trip["loading_start"]) < opening:
+                trip["constraint_violations"].append({"constraint_id": constraint_id, "penalty": constraint_penalty(parameters, constraint_id), "entity": trip["vehicle_id"]})
         for constraint_id,close in [("depot_operating_window",seconds(depot_close)),("bay_operating_window",int(bay.get("operational_end_minutes") or seconds(depot_close)//60)*60)]:
             if constraint_is_soft(parameters,constraint_id) and seconds(trip["gate_out"])>close:
                 trip["constraint_violations"].append({"constraint_id":constraint_id,"penalty":constraint_penalty(parameters,constraint_id),"entity":trip["vehicle_id"]})
@@ -223,8 +229,9 @@ def schedule_spbu(trips, bay_result, bays, parameters, day_start, depot_close, d
             base=utc(trip.get("preliminary_gate_out",gate));delta=gate-base
             order=stop["loading_order"]
             start_seconds=round((begin-zero).total_seconds())
-            if constraint_is_soft(parameters,"spbu_time_window") and ((order.get("time_window_start_minutes") is not None and start_seconds<int(order["time_window_start_minutes"])*60) or (order.get("time_window_end_minutes") is not None and start_seconds>int(order["time_window_end_minutes"])*60)):
-                trip["constraint_violations"].append({"constraint_id":"spbu_time_window","penalty":constraint_penalty(parameters,"spbu_time_window"),"entity":order["loading_order_id"]})
+            for receiving_order in stop.get("loading_orders") or [order]:
+                if constraint_is_soft(parameters,"spbu_time_window") and ((receiving_order.get("time_window_start_minutes") is not None and start_seconds<int(receiving_order["time_window_start_minutes"])*60) or (receiving_order.get("time_window_end_minutes") is not None and start_seconds>int(receiving_order["time_window_end_minutes"])*60)):
+                    trip["constraint_violations"].append({"constraint_id":"spbu_time_window","penalty":constraint_penalty(parameters,"spbu_time_window"),"entity":receiving_order["loading_order_id"]})
             stop.update(arrival=at-delta,unloading_start=begin-delta,departure=finish-delta,spbu_queue_seconds=queue,service_minutes=service/60)
             arrivals.append(round((at-gate).total_seconds()));departures.append(round((finish-gate).total_seconds()))
             queues.append({"spbu_id":stop["loading_order"]["spbu_id"],"sequence":seq+1,"arrival_offset_seconds":round((at-gate).total_seconds()),"unloading_start_offset_seconds":round((begin-gate).total_seconds()),"departure_offset_seconds":round((finish-gate).total_seconds()),"queue_seconds":queue})
@@ -245,6 +252,9 @@ def schedule_spbu(trips, bay_result, bays, parameters, day_start, depot_close, d
             live = [row for row in (left,right) if row[4] is not None and row[4] not in dropped]
             for row in live:
                 trips[row[4]].setdefault("constraint_violations",[]).append({"constraint_id":constraint_id,"penalty":constraint_penalty(parameters,constraint_id)/len(live),"entity":row[0]})
+    for index in assignments:
+        if index not in dropped:
+            trips[index]["constraint_penalty_cost"] = sum(float(row.get("penalty") or 0) for row in trips[index].get("constraint_violations", []))
     return {**bay_result,"assignments":new_assignments,"dropped_trip_indexes":sorted(dropped),"dropped_trip_reasons":{**bay_result.get("dropped_trip_reasons",{}),**{i:"SPBU_CONGESTION" for i in dropped if i in assignments}},"spbu_engine":"OR_TOOLS_CP_SAT","spbu_status":solver.status_name(status)}
 
 

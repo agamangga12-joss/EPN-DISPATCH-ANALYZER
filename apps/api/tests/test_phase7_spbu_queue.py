@@ -68,6 +68,87 @@ def test_disabled_allows_original_schedule():
     assert "spbu_engine" not in result
 
 
+@pytest.mark.parametrize("constraint_id", [
+    "vehicle_compatibility", "vehicle_capacity", "vehicle_full_load",
+    "compartment_capacity", "compartment_product_separation",
+    "vehicle_availability", "vehicle_working_time", "freeze_window",
+    "phase6_vehicle_preference", "phase6_shipment_preference",
+    "spbu_pairing_distance", "historical_pairing_preference",
+    "historical_mt_affinity_preference", "previous_vehicle_stability",
+    "previous_shipment_stability", "route_sequence_stability",
+    "bay_product_compatibility", "bay_change_stability", "bay_actual_queue",
+])
+def test_spbu_preserves_existing_penalties_with_real_bay_assignment(constraint_id):
+    data = fixture_data()
+    violation = {"constraint_id": constraint_id, "penalty": 12345, "entity": "M0"}
+    data[1][0]["constraint_violations"] = [violation]
+    # Production bay assignments include this key; previous fixtures omitted it.
+    data[2]["assignments"][0]["constraint_violations"] = []
+    result, trips = run(data)
+    assert not result["dropped_trip_indexes"]
+    assert trips[0]["constraint_violations"].count(violation) == 1
+    assert trips[0]["constraint_penalty_cost"] == sum(v["penalty"] for v in trips[0]["constraint_violations"])
+
+
+def test_spbu_replaces_stale_time_penalties_on_repeated_schedule():
+    data = fixture_data()
+    for bay in data[3]:
+        bay["operational_end_minutes"] = 1440
+    data[1][0]["constraint_violations"] = [
+        {"constraint_id": "vehicle_full_load", "penalty": 100, "entity": "M0"},
+        {"constraint_id": "spbu_time_window", "penalty": 999, "entity": "L0"},
+    ]
+    for assignment in data[2]["assignments"]:
+        assignment["constraint_violations"] = []
+    result, trips = run(data)
+    result, trips = run((data[0], trips, result, data[3]))
+    assert not result["dropped_trip_indexes"]
+    assert trips[0]["constraint_violations"] == [{"constraint_id": "vehicle_full_load", "penalty": 100, "entity": "M0"}]
+    assert trips[0]["constraint_penalty_cost"] == 100
+
+
+def test_repeated_bay_passes_replace_old_penalties(monkeypatch):
+    p, trips, result, bays = fixture_data(constraint_rules={"spbu_no_overlap": {"enabled": False}})
+    p.update(bay_scheduler_strategy="CP_SAT", max_coordination_iterations=2)
+    route = {"constraint_id": "vehicle_full_load", "penalty": 100, "entity": "M0"}
+    stale = {"constraint_id": "bay_product_compatibility", "penalty": 999, "entity": "OLD"}
+    current = {"constraint_id": "bay_product_compatibility", "penalty": 25, "entity": "B0"}
+    trips[0]["constraint_violations"] = [route, stale]
+    for assignment in result["assignments"]:
+        assignment["constraint_violations"] = [current] if assignment["trip_index"] == 0 else []
+    coordinator = OptimizationCoordinatorService()
+    monkeypatch.setattr(coordinator.bay, "schedule", lambda **kwargs: copy.deepcopy(result))
+    _, iterations, _ = coordinator._schedule_bays(
+        trips=trips, bays=bays, actual_bay_states=[], initial_queue=[], loading_durations={},
+        day_start=DAY, depot_close=DAY+timedelta(hours=24), parameters=p, deadline=perf_counter()+3,
+    )
+    assert iterations == 2
+    assert trips[0]["constraint_violations"] == [route, current]
+    assert trips[0]["constraint_penalty_cost"] == 125
+
+
+def test_receiving_window_checks_each_lo_in_shared_stop():
+    data = fixture_data(constraint_rules={"spbu_time_window": {"mode": "SOFT", "penalty": 10}})
+    stop = data[1][0]["stops"][0]
+    extra = {**stop["loading_order"], "loading_order_id": "EXTRA", "time_window_end_minutes": 1}
+    stop["loading_orders"].append(extra)
+    data[1][0]["lo_assignments"].append(extra)
+    result, trips = run(data)
+    assert not result["dropped_trip_indexes"]
+    penalties = [v for v in trips[0]["constraint_violations"] if v["constraint_id"] == "spbu_time_window"]
+    assert penalties == [{"constraint_id": "spbu_time_window", "penalty": 10, "entity": "EXTRA"}]
+
+
+def test_spbu_audits_loading_before_soft_bay_opening():
+    data = fixture_data(constraint_rules={"bay_operating_window": {"mode": "SOFT", "penalty": 10}})
+    for bay in data[3]:
+        bay.update(operational_start_minutes=600, operational_end_minutes=1440)
+    result, trips = run(data)
+    assert not result["dropped_trip_indexes"]
+    for trip in trips:
+        assert any(v["constraint_id"] == "bay_operating_window" and v["penalty"] == 10 for v in trip["constraint_violations"])
+
+
 def test_soft_overlap_is_allowed_with_audited_penalty():
     result,trips=run(fixture_data(constraint_rules={"spbu_no_overlap":{"mode":"SOFT","penalty":1}}))
     assert not result["dropped_trip_indexes"]

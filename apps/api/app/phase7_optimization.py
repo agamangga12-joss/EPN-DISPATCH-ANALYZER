@@ -489,7 +489,7 @@ class VRPOptimizationService:
                         base += constraint_penalty(parameters, "phase6_shipment_preference")
                     if source_lo.get("current_shipment_id") and source_lo.get("current_shipment_id") != target_lo.get("current_shipment_id"):
                         base += constraint_penalty(parameters, "previous_shipment_stability")
-                    pairing_score = float((source_lo.get("historical_pairing_scores") or {}).get(target_lo.get("spbu_id"), 0))
+                    pairing_score = 1.0 if source_lo.get("spbu_id") == target_lo.get("spbu_id") else float((source_lo.get("historical_pairing_scores") or {}).get(target_lo.get("spbu_id"), 0))
                     base += round((1 - pairing_score) * constraint_penalty(parameters, "historical_pairing_preference"))
                     source_sequence = source_lo.get("current_stop_sequence")
                     target_sequence = target_lo.get("current_stop_sequence")
@@ -960,7 +960,7 @@ class VRPOptimizationService:
                         constraint_violations.append({"constraint_id": "phase6_shipment_preference", "penalty": constraint_penalty(parameters, "phase6_shipment_preference"), "entity": f"{source_lo['loading_order_id']}->{target_lo['loading_order_id']}"})
                     if source_lo.get("current_shipment_id") and source_lo.get("current_shipment_id") != target_lo.get("current_shipment_id") and constraint_is_soft(parameters, "previous_shipment_stability"):
                         constraint_violations.append({"constraint_id": "previous_shipment_stability", "penalty": constraint_penalty(parameters, "previous_shipment_stability"), "entity": f"{source_lo['loading_order_id']}->{target_lo['loading_order_id']}"})
-                    pairing_score = float((source_lo.get("historical_pairing_scores") or {}).get(target_lo.get("spbu_id"), 0))
+                    pairing_score = 1.0 if source_lo.get("spbu_id") == target_lo.get("spbu_id") else float((source_lo.get("historical_pairing_scores") or {}).get(target_lo.get("spbu_id"), 0))
                     if pairing_score < 1 and constraint_is_soft(parameters, "historical_pairing_preference"):
                         constraint_violations.append({"constraint_id": "historical_pairing_preference", "penalty": round((1 - pairing_score) * constraint_penalty(parameters, "historical_pairing_preference")), "entity": f"{source_lo['loading_order_id']}->{target_lo['loading_order_id']}"})
                     source_sequence = source_lo.get("current_stop_sequence")
@@ -1961,7 +1961,10 @@ class OptimizationCoordinatorService:
                 schedule = assignment_by_trip.get(trip_index)
                 if not schedule:
                     continue
-                route_violations = list(trip.get("constraint_violations") or [])
+                # Replace bay-owned violations on every scheduling pass, rather
+                # than accumulating penalties from previous iterations/repairs.
+                bay_constraint_ids = {"bay_product_compatibility", "bay_change_stability", "bay_actual_queue", "bay_operating_window", "bay_no_overlap", "depot_operating_window", "shift_compliance"}
+                route_violations = [row for row in trip.get("constraint_violations") or [] if row.get("constraint_id") not in bay_constraint_ids]
                 bay_violations = list(schedule.get("constraint_violations") or [])
                 shift = _utc(schedule["gate_out"]) - _utc(trip["gate_out"])
                 trip.update({key: value for key, value in schedule.items() if key != "constraint_violations"})
@@ -2044,7 +2047,7 @@ class OptimizationCoordinatorService:
             if trip_index in dropped:
                 continue
             vehicle_id = trip["vehicle_id"]
-            trip["constraint_violations"] = [row for row in trip.get("constraint_violations", []) if row.get("constraint_id") != "shift_compliance"]
+            trip["constraint_violations"] = [row for row in trip.get("constraint_violations", []) if row.get("constraint_id") not in {"shift_compliance", "vehicle_working_time", "gateout_stability"}]
             late_orders = [lo for lo in trip.get("lo_assignments") or [] if lo.get("shift_gate_out_deadline") and _utc(trip["gate_out"]) > _utc(lo["shift_gate_out_deadline"])]
             if late_orders and constraint_is_hard(parameters, "shift_compliance"):
                 dropped.add(trip_index)
@@ -2106,7 +2109,7 @@ class OptimizationCoordinatorService:
                 })
             if constraint_is_soft(parameters, "freeze_window") and any(
                 lo.get("freeze_window_candidate") for lo in trip.get("lo_assignments") or []
-            ):
+            ) and not any(row.get("constraint_id") == "freeze_window" and row.get("entity") == vehicle_id for row in trip.get("constraint_violations") or []):
                 trip.setdefault("constraint_violations", []).append({
                     "constraint_id": "freeze_window",
                     "penalty": constraint_penalty(parameters, "freeze_window"),
@@ -2252,7 +2255,11 @@ class OptimizationCoordinatorService:
         )
         coordination_started = perf_counter()
         coordination_time_limit = max(1, int(parameters.get("bay_optimization_time_limit", parameters.get("optimization_time_limit", 30))))
-        coordination_deadline = coordination_started + coordination_time_limit
+        # Keep half the bay budget for repairs. CP-SAT can return FEASIBLE
+        # only at its deadline, so giving the initial schedule the whole budget
+        # prevents every post-bay reassignment from even being attempted.
+        initial_bay_time_limit = coordination_time_limit / 2
+        coordination_deadline = coordination_started + initial_bay_time_limit
         coordination_time_limit_reached = False
         trips = vrp_result["trips"]
         bay_result, iterations, coordination_time_limit_reached = self._schedule_bays(
@@ -2509,6 +2516,13 @@ class OptimizationCoordinatorService:
                 }
                 bay_eval_parameters = {**parameters, "constraint_rules": bay_eval_rules}
                 bay_retry_started = perf_counter()
+                # Share remaining bay time across pending LO instead of letting
+                # the first repair's SPBU search consume the entire reserve.
+                pending_lo_count = len(retry_orders) + sum(len(group["orders"]) for group in pending_groups)
+                candidate_bay_seconds = min(
+                    remaining_bay_seconds,
+                    max(0.01, remaining_bay_seconds * len(retry_orders) / pending_lo_count),
+                )
                 trial_bay_result, retry_iterations, retry_bay_time_limit_reached = self._schedule_bays(
                     trips=trial_trips,
                     bays=bays,
@@ -2518,7 +2532,7 @@ class OptimizationCoordinatorService:
                     day_start=day_start,
                     depot_close=depot_close,
                     parameters=bay_eval_parameters,
-                    deadline=bay_retry_started + remaining_bay_seconds,
+                    deadline=bay_retry_started + candidate_bay_seconds,
                 )
                 bay_time_used_seconds += perf_counter() - bay_retry_started
                 total_coordination_iterations += retry_iterations
@@ -2580,7 +2594,7 @@ class OptimizationCoordinatorService:
                 final_reason_code = "POST_BAY_REASSIGNMENT_TIMEOUT"
                 final_description = (
                     "Post-bay repair exhausted its route or bay budget before every compatible MT candidate "
-                    "could be proven infeasible. Review the candidate audit and increase Route Time Limit."
+                    "could be proven infeasible. Review the candidate audit and Route/Bay Time Limits."
                 )
                 terminal_solver_status = terminal_solver_status or "TIMEOUT"
                 post_bay_reassignment_timeout_lo_ids.update(group_ids)
@@ -2661,6 +2675,9 @@ class OptimizationCoordinatorService:
                 "bay_solver_status": bay_result["solver_status"],
                 "bay_raw_solver_status": bay_result.get("raw_solver_status"),
                 "bay_time_limit_seconds": coordination_time_limit,
+                "initial_bay_time_limit_seconds": initial_bay_time_limit,
+                "post_bay_reserved_time_seconds": coordination_time_limit - initial_bay_time_limit,
+                "bay_time_used_ms": round(bay_time_used_seconds * 1000),
                 "bay_time_limit_reached": bool(bay_result.get("time_limit_reached") or coordination_time_limit_reached),
                 "bay_cp_sat_workers": bay_result.get("num_search_workers", parameters.get("bay_cp_sat_workers", 8)),
                 "bay_served_trip_count": len(trips),

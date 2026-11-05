@@ -628,6 +628,21 @@ def test_full_load_defaults_to_hard_for_existing_profiles() -> None:
     assert constraint_is_hard(effective_parameters({"constraint_rules": {"vehicle_capacity": {"enabled": True, "mode": "HARD"}}}), "vehicle_full_load")
 
 
+@pytest.mark.parametrize("same_station", [True, False])
+def test_historical_pairing_only_penalizes_distinct_stations(same_station):
+    result = VRPOptimizationService().solve(
+        loading_orders=[loading_order("PAIR-1", "S1"), loading_order("PAIR-2", "S1" if same_station else "S2")],
+        vehicles=[vehicle("M1", capacity=16, compartments=2)],
+        distance_matrix=[[0, 300, 300], [300, 0, 300], [300, 300, 0]],
+        time_matrix=[[0, 300, 300], [300, 0, 300], [300, 300, 0]],
+        day_start=DAY_START, depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(**constraint_override("historical_pairing_preference", mode="SOFT", penalty=12345)),
+    )
+    assert len(result["trips"]) == 1
+    penalties = [v for v in result["trips"][0]["constraint_violations"] if v["constraint_id"] == "historical_pairing_preference"]
+    assert sum(v["penalty"] for v in penalties) == (0 if same_station else 12345)
+
+
 def test_full_load_selects_smaller_mt_instead_of_partial_preferred_mt() -> None:
     orders = [loading_order(f"LO-{index}", f"S{index}", allowed=["M1", "M2"]) for index in range(2)]
     matrix = [[0, 300, 300], [300, 0, 300], [300, 300, 0]]
@@ -1521,8 +1536,10 @@ def test_coordinator_keeps_trip_that_gates_out_before_close_and_returns_after(mo
     assert result["dropped"] == []
 
 
+@pytest.mark.parametrize("consume_initial_budget", [False, True])
 def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_state(
     monkeypatch: pytest.MonkeyPatch,
+    consume_initial_budget: bool,
 ) -> None:
     failed_lo = {
         "loading_order_id": "LO-RETRY",
@@ -1639,6 +1656,22 @@ def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_st
 
     monkeypatch.setattr(coordinator.vrp, "solve", fake_solve)
     monkeypatch.setattr(coordinator.bay, "schedule", fake_bay_schedule)
+    if consume_initial_budget:
+        real_counter = phase7_optimization.perf_counter
+        clock_offset = [0.0]
+        monkeypatch.setattr(phase7_optimization, "perf_counter", lambda: real_counter() + clock_offset[0])
+        original_schedule = coordinator._schedule_bays
+        schedule_calls = []
+
+        def consume_schedule_budget(**kwargs: object) -> tuple:
+            schedule_calls.append(kwargs["deadline"])
+            answer = original_schedule(**kwargs)
+            if len(schedule_calls) == 1:
+                # Reproduce CP-SAT returning FEASIBLE at the initial deadline.
+                clock_offset[0] = max(0, kwargs["deadline"] - real_counter())
+            return answer
+
+        monkeypatch.setattr(coordinator, "_schedule_bays", consume_schedule_budget)
     result = coordinator.optimize(
         loading_orders=[failed_lo, retained_lo],
         vehicles=[
@@ -1666,6 +1699,10 @@ def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_st
     assert result["solver_metadata"]["post_bay_reassignment_attempts"] == 1
     assert result["solver_metadata"]["post_bay_reassigned_lo_count"] == 1
     assert result["solver_metadata"]["post_bay_reassignment_exhausted_lo_count"] == 0
+    if consume_initial_budget:
+        assert len(schedule_calls) == 2
+        assert schedule_calls[1] > schedule_calls[0]
+        assert result["solver_metadata"]["post_bay_reserved_time_seconds"] > 0
 
 
 @pytest.mark.parametrize("repair_capacity", [8, 24])
